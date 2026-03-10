@@ -5,7 +5,7 @@ Gelecekteki DB migration'ını kolaylaştırmak amacıyla tüm alanlar
 açıklayıcı Field(description=...) ile belgelenmiştir.
 
 Modeller:
-    DisclosureRaw         — KAP API'den gelen ham bildirim verisi
+    DisclosureRaw         — MKK VYK API /disclosures + /disclosureDetail birleşimi
     DisclosureClassified  — Sınıflandırılmış bildirim (ek alanlar dahil)
     ClassificationResult  — Şirket ve tür bazında gruplandırılmış sonuç yapısı
 """
@@ -29,75 +29,92 @@ def _slugify(text: str) -> str:
 
 class DisclosureRaw(BaseModel):
     """
-    KAP API'den gelen ham bildirim verisi.
+    MKK VYK API'den gelen birleşik bildirim verisi.
 
-    https://www.kap.org.tr/tr/api/disclosures endpoint'inden dönen
-    JSON objesinin doğrudan temsilidir.
+    /disclosures (özet liste) + /disclosureDetail (detay) endpoint'lerinin
+    birleşiminden oluşturulur. Sadece /disclosures'dan gelen hafif nesneler
+    için detay alanları opsiyoneldir.
 
-    Kullanım:
-        >>> raw = DisclosureRaw(**api_response_item)
-        >>> print(raw.stock_codes, raw.publish_date)
+    Alanlar MKK OpenAPI spec v0.0.1 (apispec.json) ile uyumludur.
     """
 
+    # --- /disclosures endpoint'inden gelen zorunlu alanlar ---
     disclosure_index: int = Field(
         ...,
         alias="disclosureIndex",
         description="KAP sistemindeki tekil bildirim sırası / kimliği",
     )
-    info_type_desc: str = Field(
-        ...,
-        alias="infoTypeDesc",
-        description="Bildirim türünün açıklaması (örn: 'Finansal Rapor')",
-    )
-    stock_codes: str = Field(
-        ...,
-        alias="stockCodes",
-        description="İlgili hisse senedi kodu (örn: 'THYAO')",
-    )
-    company_name: str = Field(
-        ...,
-        alias="companyName",
-        description="Şirketin tam ticari unvanı",
-    )
-    title: str = Field(
-        ...,
-        alias="title",
-        description="Bildirimin başlığı",
-    )
-    publish_date: str = Field(
-        ...,
-        alias="publishDate",
-        description="Yayınlanma tarihi ve saati (format: DD.MM.YYYY HH:MM)",
-    )
-    is_old_kap: bool = Field(
-        ...,
-        alias="isOldKap",
-        description="Bildirimin eski KAP sisteminden gelip gelmediği",
-    )
-    subject: str = Field(
+    disclosure_type: str = Field(
         default="",
-        alias="subject",
-        description="Bildirimin konusu / özeti",
-    )
-    year: int | None = Field(
-        default=None,
-        alias="year",
-        description="Bildirimin ait olduğu mali yıl",
-    )
-    period: str | None = Field(
-        default=None,
-        alias="period",
-        description="Bildirimin ait olduğu dönem (örn: '3', '6', '9', '12')",
-    )
-    basic_type: str = Field(
-        ...,
-        alias="basicType",
-        description="Bildirimin ana kategorisi (örn: 'FR', 'ODA', 'GK')",
+        alias="disclosureType",
+        description="Bildirim tipi (FR, ODA, DG, DUY, FON, CA)",
     )
     disclosure_class: str = Field(
         default="",
         alias="disclosureClass",
-        description="Bildirimin KAP sınıfı",
+        description="Bildirim sınıfı (FR, ODA, DG, DUY)",
+    )
+    title: str = Field(
+        default="",
+        alias="title",
+        description="Bildirim gönderen şirket ünvanı (/disclosures'dan gelir)",
+    )
+    company_id: str = Field(
+        default="",
+        alias="companyId",
+        description="Bildirim gönderen şirket id",
+    )
+    sub_report_ids: list[str] = Field(
+        default_factory=list,
+        alias="subReportIds",
+        description="Bildirimin alt rapor id listesi",
+    )
+    accepted_data_file_types: list[str] = Field(
+        default_factory=list,
+        alias="acceptedDataFileTypes",
+        description="Alınabilecek dosya tipleri (html, presentation)",
+    )
+    fund_id: str = Field(
+        default="",
+        alias="fundId",
+        description="Fon id (fon bildirimi ise dolu gelir)",
+    )
+    fund_code: str = Field(
+        default="",
+        alias="fundCode",
+        description="Fon kodu (fon bildirimi ise dolu gelir)",
+    )
+
+    # --- /disclosureDetail endpoint'inden gelen opsiyonel alanlar ---
+    company_name: str = Field(
+        default="",
+        alias="companyName",
+        description="Şirketin tam ticari unvanı (senderTitle'dan türetilir)",
+    )
+    stock_codes: str = Field(
+        default="",
+        alias="stockCodes",
+        description="İlgili hisse senedi kodu/ları (senderExchCodes'dan türetilir)",
+    )
+    publish_date: str = Field(
+        default="",
+        alias="publishDate",
+        description="Yayınlanma tarihi ve saati (time alanından türetilir)",
+    )
+    subject: str = Field(
+        default="",
+        alias="subject",
+        description="Bildirimin konusu / özeti (subject.tr alanından türetilir)",
+    )
+    year: str = Field(
+        default="",
+        alias="year",
+        description="Bildirimin ait olduğu mali yıl",
+    )
+    kap_link: str = Field(
+        default="",
+        alias="kapLink",
+        description="KAP sayfasındaki bildirim bağlantısı (link alanından gelir)",
     )
 
     model_config = {
@@ -105,25 +122,69 @@ class DisclosureRaw(BaseModel):
         "str_strip_whitespace": True,
     }
 
+    @field_validator("disclosure_index", mode="before")
+    @classmethod
+    def coerce_index_to_int(cls, v: Any) -> int:
+        """API string olarak dönebilir, int'e zorluyoruz."""
+        return int(v)
+
     @field_validator("stock_codes", mode="before")
     @classmethod
     def normalize_stock_codes(cls, v: Any) -> str:
         """Hisse kodunu büyük harfe ve boşluksuz formata getirir."""
-        return str(v).strip().upper()
+        return str(v).strip().upper() if v else ""
 
     @property
     def publish_datetime(self) -> datetime | None:
         """
         publish_date alanını datetime nesnesine dönüştürür.
 
-        Kullanım:
-            >>> raw.publish_datetime
-            datetime(2024, 3, 15, 14, 30)
+        MKK API 'time' alanı ISO-8601 veya DD.MM.YYYY HH:MM formatında
+        gelebilir; her ikisini de dener.
         """
-        try:
-            return datetime.strptime(self.publish_date, "%d.%m.%Y %H:%M")
-        except ValueError:
-            return None
+        for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(self.publish_date, fmt)
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def from_list_item(cls, item: dict) -> "DisclosureRaw":
+        """
+        /disclosures endpoint'inden gelen özet item'dan nesne oluşturur.
+        Detay alanları (companyName, stockCodes, publishDate) boş kalır;
+        enrich_from_detail() ile sonradan doldurulur.
+        """
+        return cls(**item)
+
+    def enrich_from_detail(self, detail: dict) -> None:
+        """
+        /disclosureDetail endpoint yanıtından detay alanlarını doldurur.
+
+        MKK detail response alanları:
+          senderTitle      → company_name
+          senderExchCodes  → stock_codes (virgülle birleştirilir)
+          time             → publish_date
+          subject.tr       → subject
+          year             → year
+          link             → kap_link
+        """
+        self.company_name = detail.get("senderTitle", "") or ""
+
+        exch_codes: list = detail.get("senderExchCodes", []) or []
+        self.stock_codes = ",".join(str(c).strip().upper() for c in exch_codes if c)
+
+        self.publish_date = detail.get("time", "") or ""
+
+        subject_obj = detail.get("subject")
+        if isinstance(subject_obj, dict):
+            self.subject = subject_obj.get("tr", "") or ""
+        elif isinstance(subject_obj, str):
+            self.subject = subject_obj
+
+        self.year = str(detail.get("year", "")) or ""
+        self.kap_link = detail.get("link", "") or ""
 
 
 class DisclosureClassified(DisclosureRaw):
@@ -132,13 +193,6 @@ class DisclosureClassified(DisclosureRaw):
 
     DisclosureRaw'ı miras alır; ek olarak sınıflandırıcı katmanının
     ürettiği companySlug ve newsCategory alanlarını içerir.
-
-    Kullanım:
-        >>> classified = DisclosureClassified(
-        ...     **raw.model_dump(by_alias=True),
-        ...     companySlug="turk-hava-yollari",
-        ...     newsCategory="Finansal Raporlar",
-        ... )
     """
 
     company_slug: str = Field(
@@ -164,9 +218,11 @@ class DisclosureClassified(DisclosureRaw):
 
     @model_validator(mode="after")
     def auto_fill_slug(self) -> "DisclosureClassified":
-        """company_slug boşsa company_name'den otomatik türetir."""
-        if not self.company_slug and self.company_name:
-            self.company_slug = _slugify(self.company_name)
+        """company_slug boşsa company_name veya title'dan otomatik türetir."""
+        if not self.company_slug:
+            source = self.company_name or self.title
+            if source:
+                self.company_slug = _slugify(source)
         return self
 
     @classmethod
@@ -176,19 +232,7 @@ class DisclosureClassified(DisclosureRaw):
         news_category: str = "Diğer",
         company_slug: str = "",
     ) -> "DisclosureClassified":
-        """
-        Ham bildirimden sınıflandırılmış nesne oluşturur.
-
-        Args:
-            raw: Ham bildirim nesnesi.
-            news_category: Atanacak haber kategorisi.
-            company_slug: Atanacak şirket slug'ı (boş bırakılırsa otomatik üretilir).
-
-        Kullanım:
-            >>> classified = DisclosureClassified.from_raw(
-            ...     raw, news_category="Temettü Açıklamaları"
-            ... )
-        """
+        """Ham bildirimden sınıflandırılmış nesne oluşturur."""
         data = raw.model_dump(by_alias=True)
         data["newsCategory"] = news_category
         data["companySlug"] = company_slug
@@ -198,25 +242,9 @@ class DisclosureClassified(DisclosureRaw):
 class ClassificationResult(BaseModel):
     """
     Şirket ve tür bazında gruplandırılmış sınıflandırma sonucu.
-
-    Scheduler döngüsü sonunda üretilen ve web katmanına iletilen
-    nihai veri yapısıdır.
-
-    Kullanım:
-        >>> result = ClassificationResult(
-        ...     total=120,
-        ...     by_company={"THYAO": [...]},
-        ...     by_category={"Finansal Raporlar": [...]},
-        ...     fetched_at=datetime.utcnow(),
-        ... )
-        >>> print(result.total)
-        120
     """
 
-    total: int = Field(
-        ...,
-        description="İşlenen toplam bildirim sayısı",
-    )
+    total: int = Field(..., description="İşlenen toplam bildirim sayısı")
     by_company: dict[str, list[DisclosureClassified]] = Field(
         default_factory=dict,
         description="Hisse senedi koduna göre gruplandırılmış bildirimler",
@@ -232,10 +260,8 @@ class ClassificationResult(BaseModel):
 
     @property
     def company_count(self) -> int:
-        """Kaç farklı şirkete ait bildirim bulunduğunu döndürür."""
         return len(self.by_company)
 
     @property
     def category_count(self) -> int:
-        """Kaç farklı kategoride bildirim bulunduğunu döndürür."""
         return len(self.by_category)

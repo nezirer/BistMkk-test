@@ -36,12 +36,11 @@
 ## ⏳ Bekliyor (Kullanıcı Aksiyonu Gerekiyor)
 - [x] MKK API Portal'den API key alınması
 - [x] KAP_PROVIDER=mkk yapılması (.env güncellendi)
-- [ ] MKKProvider içindeki TODO endpoint path'lerinin doldurulması
-- [ ] MKK API entegrasyon testi (endpoint path hazır olunca)
+- [x] MKKProvider içindeki TODO endpoint path'lerinin doldurulması
+- [x] MKK API entegrasyon testi — HTTP 200, canlı bildirim çekiliyor
 
 ## 🔄 Devam Edenler
 - [ ] MockProvider ile sınıflandırma motorunu test et
-- [ ] MVP web arayüzünü MockProvider ile çalışır hale getir
 
 ## 📋 Backlog (v2)
 - [ ] Veritabanı şeması tasarımı (SQLite → PostgreSQL)
@@ -66,3 +65,7 @@ _11.03.2026 — MKK API entegrasyon güvenlik analizi yapıldı. Kritik bulgular
 _11.03.2026 — MKK gateway URL'leri resmi adreslere güncellendi: TEST=https://apigwdev.mkk.com.tr (alt: apitestint.mkk.com.tr), PROD=https://apiint.mkk.com.tr. .env ve mkk_provider.py güncellendi._
 _11.03.2026 — GitHub'a güvenli gönderim için .gitignore ve .env.example dosyaları oluşturuldu. API key ifşa riski giderildi._
 _11.03.2026 — Git deposu başlatıldı, ilk commit oluşturuldu ve `origin` olarak `https://github.com/nezirer/BistMkk-test.git` eklendi. Push denemesi yerel GitHub HTTPS kimlik doğrulaması eksik olduğu için tamamlanamadı._
+_11.03.2026 — MKKProvider tam implemente edildi: `fetch_latest()` → lastDisclosureIndex + disclosures çift adım akışı, exponential backoff (429, max 3 retry), 401/403/timeout hata logları, `fetch_by_stock_code()` → /kap/memberSecurities, `fetch_companies()` → /kap/members, `health_check()` → /kap/lastDisclosureIndex. BASE_URL apitestint.mkk.com.tr olarak güncellendi._
+_11.03.2026 — Resmi apispec.json (OpenAPI 3.0.3) analiz edildi. Kritik düzeltmeler: BASE_URL → https://apigwdev.mkk.com.tr/api/vyk (/api/vyk prefix zorunlu), path'ler → /lastDisclosureIndex, /disclosures, /disclosureDetail/{index}. DisclosureRaw modeli MKK VYK API response alanlarıyla yeniden yazıldı. classify() MKK disclosureType kodlarına uyarlandı._
+_11.03.2026 — MKK Basic Auth (MKK_API_USER / MKK_API_PASS) entegrasyonu tamamlandı. /lastDisclosureIndex HTTP 200, /disclosures HTTP 200, /disclosureDetail HTTP 200. datetime JSON serileştirme hatası (model_dump mode=json) düzeltildi. Sistem uçtan uca çalışıyor: canlı KAP bildirimi çekilip sınıflandırılıyor._
+_11.03.2026 — apispec.json uyumluluk doğrulaması yapıldı. 2 kritik düzeltme: (1) companyId parametresi spec gereği array olarak gönderiliyor {"companyId": [company_id]}. (2) mkk_provider.py docstring'deki yanlış Bearer token açıklaması → basicAuth (HTTP Basic) olarak düzeltildi._

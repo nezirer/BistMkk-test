@@ -222,7 +222,7 @@ async def api_disclosures(limit: int = 50, stock_code: str = "", category: str =
     return JSONResponse(
         content={
             "total": len(items),
-            "disclosures": [d.model_dump(by_alias=True) for d in items],
+            "disclosures": [d.model_dump(by_alias=True, mode="json") for d in items],
         }
     )
 

@@ -1,21 +1,30 @@
 """
-MKK API Portal üzerinden KAP verilerine erişim sağlar.
-Resmi API: https://apiportal.mkk.com.tr
+MKK VYK API üzerinden KAP bildirimlerine erişim sağlar.
+Resmi API spec: apispec.json (OpenAPI 3.0.3, version 0.0.1)
 
-Test ortamı : https://apigwdev.mkk.com.tr   (alternatif: https://apitestint.mkk.com.tr)
-Prod ortamı : https://apiint.mkk.com.tr
+Base URL (test) : https://apigwdev.mkk.com.tr/api/vyk
+Base URL (prod) : https://apiint.mkk.com.tr/api/vyk   (henüz test edilmedi)
 
-Erişim için gerekli:
-- MKK API Portal'den API KEY alınması (https://apiportal.mkk.com.tr)
-- IP yetkilendirmesi (MKK tarafından yapılır)
-- Borsa İstanbul veri dağıtım sözleşmesi (kurumsal kullanım için)
+Auth:
+  Her iki ortamda da : Authorization: Basic base64(user:pass)
+  Spec: basicAuth (HTTP Basic) — kullanıcı adı ve şifre portal'dan alınır.
 
-Kullanıcı aşağıdaki değişkenleri .env'e koymalı:
-MKK_API_KEY=...
-MKK_API_BASE_URL=https://apigwdev.mkk.com.tr   # test için
-MKK_ENV=test  # "test" veya "prod"
+Kullanıcı .env'e koymalı:
+  MKK_API_KEY      = <portal API key>
+  MKK_API_BASE_URL = https://apigwdev.mkk.com.tr/api/vyk
+  MKK_ENV          = test   # veya prod
+
+Kullanılan endpoint'ler (spec /paths):
+  GET /lastDisclosureIndex                  → son yayın id
+  GET /disclosures?disclosureIndex={n}      → özet bildirim listesi (max 50)
+  GET /disclosureDetail/{index}?fileType=html → şirket adı, hisse kodu, tarih
+  GET /members                              → şirket listesi
+  GET /memberDetail/{id}                    → şirket detayı
 """
 from __future__ import annotations
+
+import asyncio
+from typing import Any
 
 import httpx
 from pydantic_settings import BaseSettings
@@ -26,10 +35,14 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0  # saniye — 429 exponential backoff başlangıcı
+
 
 class MKKSettings(BaseSettings):
-    mkk_api_key: str = ""
-    mkk_api_base_url: str = "https://apigwdev.mkk.com.tr"
+    mkk_api_user: str = ""
+    mkk_api_pass: str = ""
+    mkk_api_base_url: str = "https://apigwdev.mkk.com.tr/api/vyk"
     mkk_env: str = "test"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
@@ -37,47 +50,225 @@ class MKKSettings(BaseSettings):
 
 class MKKProvider(BaseKAPProvider):
     """
-    MKK API Gateway üzerinden KAP verilerine erişim sağlar.
-    API Key ve endpoint bilgilerini .env dosyasından okur.
+    MKK API Gateway (apigwdev.mkk.com.tr/api/vyk) üzerinden KAP
+    bildirimlerine erişim sağlar.
     """
 
     def __init__(self) -> None:
         self.settings = MKKSettings()
-        self.base_url = self.settings.mkk_api_base_url
-        self.headers = {
-            "Authorization": f"Bearer {self.settings.mkk_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        self.base_url = self.settings.mkk_api_base_url.rstrip("/")
+
+        # Spec: basicAuth (HTTP Basic) — Authorization: Basic base64(user:pass)
+        self.auth = httpx.BasicAuth(
+            username=self.settings.mkk_api_user,
+            password=self.settings.mkk_api_pass,
+        )
+        self.headers: dict[str, str] = {"Accept": "application/json"}
+
         self.client = httpx.AsyncClient(
+            auth=self.auth,
             headers=self.headers,
-            timeout=20.0,
+            timeout=15.0,
             follow_redirects=True,
         )
 
+    # ------------------------------------------------------------------
+    # İç yardımcı
+    # ------------------------------------------------------------------
+
+    async def _get(self, path: str, params: dict | None = None) -> Any:
+        """
+        GET isteği gönderir.
+        - 401 → API key / yetki hatası log'u
+        - 403 → sözleşme hatası log'u
+        - 429 → exponential backoff, max 3 deneme
+        - Timeout → retry
+        Başarıda parse edilmiş JSON döner; hata durumunda exception fırlatır.
+        """
+        url = f"{self.base_url}{path}"
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                resp = await self.client.get(url, params=params)
+
+                if resp.status_code == 401:
+                    log.error(
+                        "MKK 401 — API Key geçersiz veya IP yetkisiz. "
+                        "Portal: https://apiportal.mkk.com.tr"
+                    )
+                    resp.raise_for_status()
+
+                if resp.status_code == 403:
+                    log.error(
+                        "MKK 403 — Borsa İstanbul veri dağıtım sözleşmesi gerekli. "
+                        "Portal: https://apiportal.mkk.com.tr"
+                    )
+                    resp.raise_for_status()
+
+                if resp.status_code == 429:
+                    delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    log.warning(
+                        "MKK 429 — Rate limit. Deneme {}/{}, {} sn bekleniyor.",
+                        attempt, _MAX_RETRIES, delay,
+                    )
+                    if attempt < _MAX_RETRIES:
+                        await asyncio.sleep(delay)
+                        continue
+                    resp.raise_for_status()
+
+                resp.raise_for_status()
+                return resp.json()
+
+            except httpx.TimeoutException:
+                log.error(
+                    "MKK zaman aşımı: {} (deneme {}/{})", url, attempt, _MAX_RETRIES
+                )
+                if attempt == _MAX_RETRIES:
+                    raise
+                await asyncio.sleep(_RETRY_BASE_DELAY * attempt)
+
+            except httpx.HTTPStatusError:
+                raise
+
+            except Exception as exc:
+                log.error("MKK beklenmedik hata: {} — {}", url, exc)
+                raise
+
+        return None  # ulaşılmaz
+
+    # ------------------------------------------------------------------
+    # Public metodlar
+    # ------------------------------------------------------------------
+
     async def fetch_latest(self, limit: int = 50) -> list[DisclosureRaw]:
         """
-        MKK KAP Veri Yayın Servisi üzerinden son bildirimleri çeker.
-        ⚠️ Endpoint path'i kullanıcının MKK API Portal'den aldığı
-           dokümana göre güncellenmelidir.
+        1. GET /lastDisclosureIndex           → son yayın id'sini al
+        2. GET /disclosures?disclosureIndex=n → özet liste (max 50 kayıt)
+        3. Her kayıt için GET /disclosureDetail/{index}?fileType=html
+           → şirket adı, hisse kodu, yayın tarihi, konu zenginleştirmesi
+        4. DisclosureRaw listesi olarak döndür
         """
-        # TODO: Kullanıcı MKK API Portal'den aldığı endpoint path'i buraya yazacak
-        # Örnek: /kap/v1/disclosures veya /bildirim/liste gibi
-        log.warning("MKK endpoint path henüz yapılandırılmadı, boş liste dönüyor.")
-        return []
+        # Adım 1: Son index
+        try:
+            idx_payload = await self._get("/lastDisclosureIndex")
+        except Exception as exc:
+            log.error("lastDisclosureIndex alınamadı: {}", exc)
+            return []
+
+        if not isinstance(idx_payload, dict) or "lastDisclosureIndex" not in idx_payload:
+            log.warning("lastDisclosureIndex beklenen formatta değil: {}", idx_payload)
+            return []
+
+        last_index = idx_payload["lastDisclosureIndex"]
+        log.info("KAP son bildirim index: {}", last_index)
+
+        # Adım 2: Özet liste
+        try:
+            items = await self._get(
+                "/disclosures",
+                params={"disclosureIndex": last_index},
+            )
+        except Exception as exc:
+            log.error("disclosures çekilemedi (index={}): {}", last_index, exc)
+            return []
+
+        if not items:
+            log.info("KAP: No new disclosures since index {}", last_index)
+            return []
+
+        if not isinstance(items, list):
+            log.warning("KAP /disclosures liste dönmedi (tip: {})", type(items).__name__)
+            return []
+
+        # Adım 3: Her bildirim için detay çek → zenginleştir
+        results: list[DisclosureRaw] = []
+        batch = items[:limit]
+        for raw_item in batch:
+            try:
+                disclosure = DisclosureRaw.from_list_item(raw_item)
+            except Exception as exc:
+                log.warning(
+                    "DisclosureRaw parse hatası atlandı (index={}): {}",
+                    raw_item.get("disclosureIndex"), exc,
+                )
+                continue
+
+            # Detay çağrısı — hata olursa özet verisiyle devam et
+            try:
+                detail = await self._get(
+                    f"/disclosureDetail/{disclosure.disclosure_index}",
+                    params={"fileType": "html"},
+                )
+                if isinstance(detail, dict):
+                    disclosure.enrich_from_detail(detail)
+            except Exception as exc:
+                log.warning(
+                    "disclosureDetail alınamadı (index={}), özet veriyle devam ediliyor: {}",
+                    disclosure.disclosure_index, exc,
+                )
+
+            results.append(disclosure)
+
+        log.info(
+            "KAP fetch_latest tamamlandı: {} bildirim (son index: {}).",
+            len(results), last_index,
+        )
+        return results
 
     async def fetch_by_stock_code(self, code: str) -> list[DisclosureRaw]:
-        # TODO: Kullanıcı endpoint path'ini girdikten sonra implemente et
-        return []
+        """
+        Belirli bir hisse koduna ait şirketin son bildirimlerini çeker.
+        Önce /members listesinden companyId bulunur, ardından /disclosures
+        filtrelenerek getirilir.
+        """
+        companies = await self.fetch_companies()
+        company_id = next(
+            (str(c.get("id", "")) for c in companies
+             if code.upper() in [str(ec).upper() for ec in (c.get("exchCodes") or [])]),
+            None,
+        )
+        if not company_id:
+            log.warning("Hisse kodu için şirket bulunamadı: {}", code)
+            return []
+
+        try:
+            idx_payload = await self._get("/lastDisclosureIndex")
+            last_index = idx_payload.get("lastDisclosureIndex") if isinstance(idx_payload, dict) else None
+            if not last_index:
+                return []
+
+            items = await self._get(
+                "/disclosures",
+                params={"disclosureIndex": last_index, "companyId": [company_id]},
+            )
+        except Exception as exc:
+            log.error("fetch_by_stock_code başarısız (code={}): {}", code, exc)
+            return []
+
+        if not isinstance(items, list):
+            return []
+
+        results: list[DisclosureRaw] = []
+        for raw_item in items:
+            try:
+                results.append(DisclosureRaw.from_list_item(raw_item))
+            except Exception as exc:
+                log.warning("parse hatası (atlandı): {}", exc)
+        return results
 
     async def fetch_companies(self) -> list[dict]:
-        # TODO: Kullanıcı endpoint path'ini girdikten sonra implemente et
-        return []
+        """GET /members → tüm KAP üyesi şirket listesi."""
+        try:
+            data = await self._get("/members")
+            return data if isinstance(data, list) else []
+        except Exception as exc:
+            log.error("members alınamadı: {}", exc)
+            return []
 
     async def health_check(self) -> bool:
+        """GET /lastDisclosureIndex ile gateway bağlantısını doğrular."""
         try:
-            resp = await self.client.get(f"{self.base_url}")
-            return resp.status_code < 500
+            payload = await self._get("/lastDisclosureIndex")
+            return isinstance(payload, dict) and "lastDisclosureIndex" in payload
         except Exception as exc:
             log.error("MKK health check başarısız: {}", exc)
             return False
