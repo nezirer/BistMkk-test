@@ -162,10 +162,14 @@ class MKKProvider(BaseKAPProvider):
         log.info("KAP son bildirim index: {}", last_index)
 
         # Adım 2: Özet liste
+        # Not: /disclosures endpoint'i verilen index'ten itibaren (>=) döndüğü için
+        # son N bildirimi alabilmek adına biraz geriden başlamamız gerekiyor.
+        # Örn: limit=50 ise last_index-49'dan başlayarak çağırıyoruz.
+        start_index = max(0, int(last_index) - (limit - 1))
         try:
             items = await self._get(
                 "/disclosures",
-                params={"disclosureIndex": last_index},
+                params={"disclosureIndex": start_index},
             )
         except Exception as exc:
             log.error("disclosures çekilemedi (index={}): {}", last_index, exc)

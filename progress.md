@@ -1,6 +1,6 @@
 # KAP Classifier — İlerleme Takibi
 
-## Durum: 🟢 MVP Tamamlandı
+## Durum: 🟢 v2 — PostgreSQL Entegrasyonu Tamamlandı ve Test Edildi
 
 ---
 
@@ -42,14 +42,31 @@
 ## 🔄 Devam Edenler
 - [ ] MockProvider ile sınıflandırma motorunu test et
 
-## 📋 Backlog (v2)
-- [ ] Veritabanı şeması tasarımı (SQLite → PostgreSQL)
-- [ ] SQLAlchemy modelleri ve Alembic migration'ları
+## ✅ Tamamlananlar (v2 — PostgreSQL Entegrasyonu)
+- [x] `psycopg2-binary>=2.9.9` requirements.txt'e eklendi (oracledb kaldırıldı)
+- [x] `db/connection.py` — psycopg2 ThreadedConnectionPool, async context manager, bağlantı havuzu (min=1, max=5)
+- [x] `db/schema.sql` — PostgreSQL DDL: kap_disclosures, kap_companies, kap_company_details, kap_sync_state (JSONB, INSERT ON CONFLICT)
+- [x] `db/models.py` — Python'dan otomatik tablo oluşturma (CREATE TABLE IF NOT EXISTS — idempotent)
+- [x] `db/repository.py` — CRUD: upsert_disclosure, get_disclosures, disclosure_exists, get_last_seen_index, update_last_seen_index, upsert_company, upsert_company_detail, get_companies, companies_stale
+- [x] `main.py` — in-memory deque/set kaldırıldı, PostgreSQL repository ile değiştirildi
+- [x] `.env` — PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASSWORD değişkenleri eklendi
+- [x] API limit koruması: polling her çalışmada DB'deki son index'ten başlar, mevcut bildirimler tekrar çekilmez, şirket listesi 24 saatte bir yenilenir
+- [x] PostgreSQL DB kuruldu: OCI sunucusundaki `invoice-db` container'ına `kap_db` ve `kap_user` eklendi
+- [x] `.env` PG bağlantı bilgileriyle güncellendi — local geliştirme için `PG_HOST=132.226.192.163` ile uzaktan bağlanılıyor
+- [x] Uçtan uca test tamamlandı: 50 bildirim çekildi, sınıflandırıldı, `kap_disclosures` tablosuna yazıldı (`SELECT COUNT(*) → 50`)
+
+## ⏳ Bekliyor (Kullanıcı Aksiyonu)
+- [ ] Uygulamayı OCI sunucusuna taşı (`scp` veya `git clone`)
+- [ ] Sunucuda `PG_HOST=localhost` olarak güncelle
+- [ ] Sunucuda `pip install -r requirements.txt && uvicorn main:app` ile başlat
+- [ ] OCI Security List'te 5432 portunu yalnızca kendi IP'nize kısıtlayın (güvenlik)
+
+## 📋 Backlog (v3)
 - [ ] LLM entegrasyon katmanı (otomatik özet + sentiment analizi)
 - [ ] Şirket bazlı alert / bildirim sistemi
 - [ ] REST API dokümantasyonu (OpenAPI genişletme)
-- [ ] JSON önbellek dosyasına kalıcı yazma (uygulama yeniden başlatmada veri kaybı önleme)
 - [ ] Sayfalama (pagination) desteği web arayüzünde
+- [ ] Şirket detayları (`/memberDetail/{id}`) DB'ye önbellekleme
 
 ---
 ## ⚠️ Kritik Değişiklik
@@ -69,3 +86,6 @@ _11.03.2026 — MKKProvider tam implemente edildi: `fetch_latest()` → lastDisc
 _11.03.2026 — Resmi apispec.json (OpenAPI 3.0.3) analiz edildi. Kritik düzeltmeler: BASE_URL → https://apigwdev.mkk.com.tr/api/vyk (/api/vyk prefix zorunlu), path'ler → /lastDisclosureIndex, /disclosures, /disclosureDetail/{index}. DisclosureRaw modeli MKK VYK API response alanlarıyla yeniden yazıldı. classify() MKK disclosureType kodlarına uyarlandı._
 _11.03.2026 — MKK Basic Auth (MKK_API_USER / MKK_API_PASS) entegrasyonu tamamlandı. /lastDisclosureIndex HTTP 200, /disclosures HTTP 200, /disclosureDetail HTTP 200. datetime JSON serileştirme hatası (model_dump mode=json) düzeltildi. Sistem uçtan uca çalışıyor: canlı KAP bildirimi çekilip sınıflandırılıyor._
 _11.03.2026 — apispec.json uyumluluk doğrulaması yapıldı. 2 kritik düzeltme: (1) companyId parametresi spec gereği array olarak gönderiliyor {"companyId": [company_id]}. (2) mkk_provider.py docstring'deki yanlış Bearer token açıklaması → basicAuth (HTTP Basic) olarak düzeltildi._
+_12.03.2026 — Oracle Always Free veritabanı entegrasyonu tamamlandı. in-memory deque/set → Oracle DB (oracledb thin mode, Wallet bağlantısı). 4 tablo: KAP_DISCLOSURES, KAP_COMPANIES, KAP_COMPANY_DETAILS, KAP_SYNC_STATE. API limit koruması: polling her seferinde son kaydedilen index'ten başlar. Şirket listesi 24 saatlik TTL ile önbelleklenir._
+_12.03.2026 — DB katmanı Oracle XE'den PostgreSQL'e geçirildi. OCI Compute Instance ARM64 (aarch64) mimarisi Oracle XE imajıyla uyumsuz olduğu için psycopg2-binary + PostgreSQL Docker kullanımına geçildi. Tüm Oracle SQL sözdizimi (MERGE INTO, DUAL, VARCHAR2, CLOB, SYSTIMESTAMP) PostgreSQL karşılıklarına (INSERT ON CONFLICT, VARCHAR, JSONB, NOW()) dönüştürüldü._
+_12.03.2026 — Uçtan uca test başarılı. PostgreSQL kap_db'ye bağlantı kuruldu, tablolar otomatik oluşturuldu, 50 KAP bildirimi çekilip sınıflandırılarak kap_disclosures tablosuna yazıldı. SELECT COUNT(*) → 50 doğrulandı._

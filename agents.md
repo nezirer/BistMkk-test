@@ -4,18 +4,21 @@
 KAP bildirimlerini otomatik olarak çekip şirket ve tür bazında sınıflandırmak.
 
 ## Mimari Kararlar
-- **Şu an:** Veritabanı YOK. Veriler bellekte (in-memory) tutulur, JSON dosyasına cache'lenir.
-- **Gelecek v2:** SQLite → PostgreSQL geçişi + LLM sınıflandırma katmanı eklenecek.
+- **Şu an (v2):** PostgreSQL veritabanı aktif. OCI Compute Instance (Ubuntu 24.04 ARM64) üzerinde `invoice-db` adlı mevcut PostgreSQL Docker container'ına `kap_db` veritabanı ve `kap_user` eklendi.
+- **DB Katmanı:** `db/` klasörü — `connection.py` (psycopg2 havuzu), `models.py` (otomatik tablo oluşturma), `repository.py` (CRUD), `schema.sql` (el ile DDL)
+- **API limit koruması:** Her polling döngüsünde DB'deki son `disclosure_index`'ten itibaren yalnızca yeni bildirimler çekilir. Mevcut kayıtlar tekrar API'den sorgulanmaz.
+- **Şirket listesi:** 24 saatlik TTL ile `kap_companies` tablosunda önbelleklenir, `/members` endpoint'i günde bir kez çağrılır.
 - **API:** Provider pattern (BaseKAPProvider) — bkz. fetcher/ klasörü
 - **Polling:** Her 3 dakikada bir yeni bildirimleri çek (APScheduler)
 - **Web:** MVP — Jinja2 + minimal Tailwind CSS. SPA veya React KULLANMA.
 
 ## Geliştirme Kuralları
 1. Her yeni özellik önce bu dosyada belgelenir, sonra kodlanır.
-2. Veritabanı gerektiren hiçbir bağımlılık ekleme (SQLAlchemy, Alembic vb.) — v2'ye bırak.
+2. DB işlemleri yalnızca `db/repository.py` üzerinden yapılır; SQL doğrudan başka dosyalara yazılmaz.
 3. Sınıflandırma mantığı `classifier/` altında izole tutulmalı (LLM entegrasyonuna hazır).
 4. Tüm KAP veri erişimi `BaseKAPProvider` arayüzü üzerinden yapılır; provider `get_provider()` factory fonksiyonu ile seçilir.
-5. Pydantic modelleri schema-first prensibiyle tasarlanır (DB migration kolaylığı için).
+5. Pydantic modelleri schema-first prensibiyle tasarlanır.
+6. Yeni tablo/sütun eklendiğinde hem `db/models.py` hem `db/schema.sql` güncellenir.
 
 ## ⛔ Kaldırılan Yaklaşım (v0 - KULLANILAMAZ)
 - `kap.org.tr/tr/api/disclosures` endpoint'i artık public erişime kapalı
@@ -54,8 +57,17 @@ KAP bildirimlerini otomatik olarak çekip şirket ve tür bazında sınıflandı
 - Temettü Açıklamaları
 - Diğer
 
-## Gelecek Özellikler (v2+)
-- [ ] PostgreSQL entegrasyonu
+## Veritabanı Bilgileri
+- **Sunucu:** OCI Compute Instance — `132.226.192.163` (eu-frankfurt-1, ARM64)
+- **Container:** `invoice-db` (postgres:16-alpine, port 5432)
+- **Veritabanı:** `kap_db`
+- **Kullanıcı:** `kap_user`
+- **Tablolar:** `kap_disclosures`, `kap_companies`, `kap_company_details`, `kap_sync_state`
+- **Bağlantı (local geliştirme):** `.env` → `PG_HOST=132.226.192.163` ile uzaktan bağlanılır
+- **Bağlantı (sunucu):** Uygulama sunucuya taşındığında `PG_HOST=localhost` yapılır
+
+## Gelecek Özellikler (v3+)
 - [ ] LLM ile otomatik özet ve sentiment analizi
 - [ ] Şirket bazlı alert sistemi
 - [ ] REST API endpoint'leri (dış kullanım için)
+- [ ] Şirket detayları (`/memberDetail/{id}`) DB'ye önbellekleme

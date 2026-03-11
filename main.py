@@ -1,8 +1,7 @@
-"""FastAPI giriş noktası — APScheduler + in-memory store."""
+"""FastAPI giriş noktası — APScheduler + PostgreSQL store."""
 from __future__ import annotations
 
 import os
-from collections import deque
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,6 +15,9 @@ from fastapi.templating import Jinja2Templates
 
 import classifier.company as company_svc
 import classifier.news_type as news_svc
+import db.repository as repo
+from db.connection import init_pool, close_pool, get_connection
+from db.models import create_tables
 from fetcher.base_provider import BaseKAPProvider
 from fetcher.provider_factory import get_provider
 from models.disclosure import DisclosureClassified, DisclosureRaw
@@ -24,12 +26,6 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 templates = Jinja2Templates(directory="web/templates")
 
-# ---------------------------------------------------------------------------
-# In-memory store — max 1000 kayıt (deque otomatik kırpar)
-# ---------------------------------------------------------------------------
-
-_store: deque[DisclosureClassified] = deque(maxlen=1000)
-_seen_ids: set[int] = set()
 _scheduler = AsyncIOScheduler()
 _provider: BaseKAPProvider | None = None
 
@@ -48,9 +44,18 @@ def _provider_label() -> str:
 # ---------------------------------------------------------------------------
 
 async def _fetch_and_classify() -> None:
-    """KAP'tan son bildirimleri çekip sınıflandırarak store'a ekler."""
+    """
+    KAP'tan son bildirimleri çekip sınıflandırarak Oracle DB'ye kaydeder.
+
+    API limit koruması:
+      1. DB'deki son disclosure_index alınır.
+      2. MKK'dan sadece o index'ten itibaren yeni bildirimler çekilir.
+      3. Her bildirim DB'de mevcut değilse kaydedilir.
+      4. Şirket listesi 24 saatte bir yenilenir (companies_stale kontrolü).
+    """
     global _provider
     log.info("Polling başladı (provider: {}).", _provider_label())
+
     try:
         if _provider is None:
             _provider = get_provider()
@@ -60,8 +65,11 @@ async def _fetch_and_classify() -> None:
         return
 
     new_count = 0
+    max_index = 0
+
     for raw in raw_items:
-        if raw.disclosure_index in _seen_ids:
+        # DB'de zaten varsa API'yi atlayıp devam et
+        if await repo.disclosure_exists(raw.disclosure_index):
             continue
 
         try:
@@ -76,14 +84,30 @@ async def _fetch_and_classify() -> None:
             log.warning("Bildirim sınıflandırılamadı: {} — {}", raw.disclosure_index, exc)
             continue
 
-        _store.appendleft(classified)
-        _seen_ids.add(raw.disclosure_index)
-        new_count += 1
+        try:
+            await repo.upsert_disclosure(classified)
+            new_count += 1
+            if raw.disclosure_index > max_index:
+                max_index = raw.disclosure_index
+        except Exception as exc:
+            log.error("DB yazma hatası (index={}): {}", raw.disclosure_index, exc)
 
-    new_items = [r for r in raw_items if r.disclosure_index not in (_seen_ids - {d.disclosure_index for d in _store})]
-    company_svc.update_registry(new_items)
+    # Son index'i kaydet
+    if max_index > 0:
+        await repo.update_last_seen_index(max_index)
 
-    log.info("Polling tamamlandı: {} yeni bildirim eklendi (toplam store: {}).", new_count, len(_store))
+    # Şirket listesini 24 saatte bir güncelle
+    try:
+        if await repo.companies_stale(ttl_hours=24):
+            companies = await _provider.fetch_companies()
+            for member in companies:
+                await repo.upsert_company(member)
+            company_svc.update_registry(raw_items)
+            log.info("Şirket listesi güncellendi ({} kayıt).", len(companies))
+    except Exception as exc:
+        log.warning("Şirket listesi güncellenemedi: {}", exc)
+
+    log.info("Polling tamamlandı: {} yeni bildirim DB'ye eklendi.", new_count)
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +118,28 @@ async def _fetch_and_classify() -> None:
 async def lifespan(app: FastAPI):
     global _provider
     log.info("KAP Classifier başlatılıyor (provider: {})...", _provider_label())
+
+    # PostgreSQL bağlantı havuzunu başlat
+    init_pool()
+
+    # DB şemasını oluştur (eksik tablolar — IF NOT EXISTS, idempotent)
+    async with get_connection() as conn:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, create_tables, conn)
+
+    # Provider ve ilk polling
     _provider = get_provider()
     await _fetch_and_classify()
+
     _scheduler.add_job(_fetch_and_classify, "interval", minutes=3, id="kap_poll")
     _scheduler.start()
     log.info("APScheduler başlatıldı — her 3 dakikada bir polling.")
+
     yield
+
     _scheduler.shutdown(wait=False)
+    close_pool()
     log.info("KAP Classifier kapatılıyor...")
 
 
@@ -110,8 +149,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="KAP Classifier",
-    description="KAP bildirimlerini çekip sınıflandıran MVP uygulama",
-    version="0.1.0",
+    description="KAP bildirimlerini çekip sınıflandıran ve PostgreSQL'e kaydeden uygulama",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -120,20 +159,6 @@ app.mount("/static", StaticFiles(directory="web/static"), name="static")
 
 # ---------------------------------------------------------------------------
 # Yardımcı
-# ---------------------------------------------------------------------------
-
-def _sorted_store() -> list[DisclosureClassified]:
-    """Store'daki bildirimleri publishDate'e göre tersten sıralar."""
-    items = list(_store)
-    items.sort(
-        key=lambda d: d.publish_datetime or __import__("datetime").datetime.min,
-        reverse=True,
-    )
-    return items
-
-
-# ---------------------------------------------------------------------------
-# Endpoint'ler
 # ---------------------------------------------------------------------------
 
 def _base_ctx() -> dict:
@@ -145,11 +170,15 @@ def _base_ctx() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Endpoint'ler
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 async def index(request: Request):
-    """Ana sayfa — son 50 bildirimi listeler."""
-    disclosures = _sorted_store()[:50]
-    companies = company_svc.get_all_companies()
+    """Ana sayfa — son 50 bildirimi listeler (DB'den)."""
+    disclosures = await repo.get_disclosures(limit=50)
+    companies = await repo.get_companies()
     return templates.TemplateResponse(
         "index.html",
         {
@@ -158,7 +187,7 @@ async def index(request: Request):
             "disclosures": disclosures,
             "companies": companies,
             "categories": news_svc.ALL_CATEGORIES,
-            "total": len(_store),
+            "total": len(disclosures),
             **_base_ctx(),
         },
     )
@@ -166,20 +195,23 @@ async def index(request: Request):
 
 @app.get("/company/{stock_code}")
 async def company_detail(request: Request, stock_code: str):
-    """Şirkete ait tüm bildirimleri listeler."""
+    """Şirkete ait tüm bildirimleri listeler (DB'den)."""
     code = stock_code.strip().upper()
-    company = company_svc.get_company(code)
-    if company is None and not any(d.stock_codes == code for d in _store):
+    disclosures = await repo.get_disclosures(limit=500, stock_code=code)
+    companies = await repo.get_companies(stock_code=code)
+    company = companies[0] if companies else None
+
+    if not company and not disclosures:
         raise HTTPException(status_code=404, detail=f"'{code}' hisse kodu bulunamadı.")
 
-    disclosures = [d for d in _sorted_store() if d.stock_codes == code]
+    company_name = company["title"] if company else code
     return templates.TemplateResponse(
         "company.html",
         {
             "request": request,
             "title": f"{code} — Bildirimleri",
             "stock_code": code,
-            "company_name": company.company_name if company else code,
+            "company_name": company_name,
             "disclosures": disclosures,
             **_base_ctx(),
         },
@@ -188,12 +220,9 @@ async def company_detail(request: Request, stock_code: str):
 
 @app.get("/category/{category}")
 async def category_detail(request: Request, category: str):
-    """Kategoriye ait tüm bildirimleri listeler."""
+    """Kategoriye ait tüm bildirimleri listeler (DB'den)."""
     label = news_svc.get_category_label(category)
-    disclosures = [
-        d for d in _sorted_store()
-        if d.news_category == label
-    ]
+    disclosures = await repo.get_disclosures(limit=500, category=label)
     return templates.TemplateResponse(
         "category.html",
         {
@@ -208,20 +237,27 @@ async def category_detail(request: Request, category: str):
 
 
 @app.get("/api/disclosures")
-async def api_disclosures(limit: int = 50, stock_code: str = "", category: str = "") -> JSONResponse:
-    """JSON API — bildirim listesi (isteğe bağlı filtreler: stock_code, category)."""
-    items = _sorted_store()
-
-    if stock_code:
-        items = [d for d in items if d.stock_codes == stock_code.strip().upper()]
+async def api_disclosures(
+    limit: int = 50,
+    stock_code: str = "",
+    category: str = "",
+    offset: int = 0,
+) -> JSONResponse:
+    """JSON API — bildirim listesi (isteğe bağlı filtreler: stock_code, category, limit, offset)."""
+    category_label = ""
     if category:
-        label = news_svc.get_category_label(category)
-        items = [d for d in items if d.news_category == label]
+        category_label = news_svc.get_category_label(category)
 
-    items = items[:limit]
+    items = await repo.get_disclosures(
+        limit=limit,
+        stock_code=stock_code.strip().upper() if stock_code else "",
+        category=category_label,
+        offset=offset,
+    )
     return JSONResponse(
         content={
             "total": len(items),
+            "offset": offset,
             "disclosures": [d.model_dump(by_alias=True, mode="json") for d in items],
         }
     )
@@ -229,18 +265,18 @@ async def api_disclosures(limit: int = 50, stock_code: str = "", category: str =
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "store_size": len(_store)}
+    return {"status": "ok"}
 
 
 @app.get("/status")
 async def status():
-    """Provider durumu ve sistem bilgisi."""
+    """Provider ve DB durumu."""
     provider_ok = await _provider.health_check() if _provider else False
+    last_index = await repo.get_last_seen_index()
     return {
         "status": "ok",
         "provider": _provider_name(),
         "provider_label": _provider_label(),
         "provider_healthy": provider_ok,
-        "store_size": len(_store),
-        "seen_ids": len(_seen_ids),
+        "last_disclosure_index": last_index,
     }

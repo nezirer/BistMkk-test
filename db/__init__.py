@@ -1,0 +1,1 @@
+"""Oracle veritabanı katmanı."""
