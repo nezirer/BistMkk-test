@@ -98,7 +98,7 @@ async def get_connection() -> AsyncGenerator[psycopg2.extensions.connection, Non
             with conn.cursor() as cur:
                 cur.execute(...)
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     conn: psycopg2.extensions.connection = await loop.run_in_executor(
         None, get_pool().getconn
     )

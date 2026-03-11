@@ -20,7 +20,7 @@ class MockProvider(BaseKAPProvider):
     uçtan uca test yapılabilir.
     """
 
-    async def fetch_latest(self, limit: int = 50) -> list[DisclosureRaw]:
+    async def fetch_latest(self, limit: int = 50, since_index: int = 0) -> list[DisclosureRaw]:
         if MOCK_DATA_PATH.exists():
             raw = json.loads(MOCK_DATA_PATH.read_text(encoding="utf-8"))
             return [DisclosureRaw(**item) for item in raw[:limit]]
@@ -31,14 +31,18 @@ class MockProvider(BaseKAPProvider):
         return [d for d in data if code.upper() in (d.stock_codes or "").upper()]
 
     async def fetch_companies(self) -> list[dict]:
+        # upsert_company() beklediği anahtarlar: id, title, stockCode, memberType, kfifUrl
         return [
-            {"code": "THYAO", "name": "Türk Hava Yolları A.O."},
-            {"code": "GARAN", "name": "T. Garanti Bankası A.Ş."},
-            {"code": "AKBNK", "name": "Akbank T.A.Ş."},
+            {"id": "1001", "title": "Türk Hava Yolları A.O.", "stockCode": "THYAO", "memberType": "BIST", "kfifUrl": ""},
+            {"id": "1002", "title": "T. Garanti Bankası A.Ş.", "stockCode": "GARAN", "memberType": "BIST", "kfifUrl": ""},
+            {"id": "1003", "title": "Akbank T.A.Ş.", "stockCode": "AKBNK", "memberType": "BIST", "kfifUrl": ""},
         ]
 
     async def health_check(self) -> bool:
         return True
+
+    async def close(self) -> None:
+        pass
 
     def _sample_data(self) -> list[DisclosureRaw]:
         return []

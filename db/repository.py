@@ -42,7 +42,7 @@ async def upsert_disclosure(disclosure: DisclosureClassified) -> None:
     PostgreSQL: INSERT ... ON CONFLICT DO UPDATE
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _upsert_disclosure_sync, conn, disclosure)
 
 
@@ -105,7 +105,7 @@ def _upsert_disclosure_sync(
 async def disclosure_exists(index: int) -> bool:
     """Belirtilen disclosure_index veritabanında mevcut mu?"""
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _disclosure_exists_sync, conn, index)
 
 
@@ -128,12 +128,12 @@ async def get_disclosures(
 ) -> list[DisclosureClassified]:
     """
     DB'den sıralı bildirim listesi döndürür.
-    - stock_code filtresi: stock_codes exact match
+    - stock_code filtresi: stock_codes ILIKE (kısmi eşleşme, çoklu kodları destekler)
     - category filtresi: news_category exact match
     - Sıralama: disclosure_index DESC (en yeni önce)
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, _get_disclosures_sync, conn, limit, stock_code, category, offset
         )
@@ -150,8 +150,10 @@ def _get_disclosures_sync(
     params: list[Any] = []
 
     if stock_code:
-        where_clauses.append("stock_codes = %s")
-        params.append(stock_code.upper())
+        # stock_codes virgülle ayrılmış çoklu kod içerebilir (örn: "THYAO,THYAO2")
+        # Exact match yerine ILIKE ile kısmi eşleşme yapılır
+        where_clauses.append("stock_codes ILIKE %s")
+        params.append(f"%{stock_code.upper()}%")
 
     if category:
         where_clauses.append("news_category = %s")
@@ -221,7 +223,7 @@ async def get_last_seen_index() -> int:
     DB'de hiç kayıt yoksa 0 döner.
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _get_last_seen_index_sync, conn)
 
 
@@ -249,7 +251,7 @@ def _get_last_seen_index_sync(conn: psycopg2.extensions.connection) -> int:
 async def update_last_seen_index(index: int) -> None:
     """kap_sync_state tablosunu son görülen indeksle günceller."""
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _update_last_seen_index_sync, conn, index)
 
 
@@ -279,7 +281,7 @@ async def upsert_company(member: dict) -> None:
     member dict beklenen alanlar: id, title, stockCode, memberType, kfifUrl
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _upsert_company_sync, conn, member)
 
 
@@ -326,7 +328,7 @@ async def upsert_company_detail(member_id: str, detail: dict) -> None:
     Tüm detay JSONB sütununa yazılır.
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _upsert_company_detail_sync, conn, member_id, detail)
 
 
@@ -363,7 +365,7 @@ async def get_companies(stock_code: str = "") -> list[dict]:
     stock_code verilirse exact match filtresi uygulanır.
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _get_companies_sync, conn, stock_code)
 
 
@@ -409,7 +411,7 @@ async def companies_stale(ttl_hours: int = 24) -> bool:
     Tabloda hiç kayıt yoksa veya TTL dolmuşsa True döner.
     """
     async with get_connection() as conn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _companies_stale_sync, conn, ttl_hours)
 
 

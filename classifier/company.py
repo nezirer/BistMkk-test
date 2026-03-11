@@ -53,6 +53,9 @@ def get_company_slug(stock_code: str, company_name: str) -> str:
     """
     normalized = stock_code.strip().upper()
 
+    if not normalized:
+        return _slugify(company_name) if company_name else ""
+
     if normalized in _company_registry:
         return _company_registry[normalized].slug
 
@@ -73,6 +76,8 @@ def update_registry(disclosures: list) -> None:
     added = 0
     for d in disclosures:
         code = d.stock_codes.strip().upper()
+        if not code:
+            continue
         if code not in _company_registry:
             info = CompanyInfo(stock_code=code, company_name=d.company_name)
             _company_registry[code] = info

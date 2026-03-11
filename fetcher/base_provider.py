@@ -9,8 +9,12 @@ class BaseKAPProvider(ABC):
     """
 
     @abstractmethod
-    async def fetch_latest(self, limit: int = 50) -> list[DisclosureRaw]:
-        """Son N bildirimi döndürür."""
+    async def fetch_latest(self, limit: int = 50, since_index: int = 0) -> list[DisclosureRaw]:
+        """
+        Son bildirimleri döndürür.
+        since_index > 0 ise yalnızca o index'ten büyük olanlar çekilir
+        (API rate limit koruması).
+        """
         ...
 
     @abstractmethod
@@ -27,3 +31,6 @@ class BaseKAPProvider(ABC):
     async def health_check(self) -> bool:
         """Provider'ın erişilebilir olup olmadığını kontrol eder."""
         ...
+
+    async def close(self) -> None:
+        """Provider kaynaklarını serbest bırakır (HTTP client vb.)."""

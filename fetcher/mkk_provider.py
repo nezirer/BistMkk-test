@@ -139,13 +139,16 @@ class MKKProvider(BaseKAPProvider):
     # Public metodlar
     # ------------------------------------------------------------------
 
-    async def fetch_latest(self, limit: int = 50) -> list[DisclosureRaw]:
+    async def fetch_latest(self, limit: int = 50, since_index: int = 0) -> list[DisclosureRaw]:
         """
         1. GET /lastDisclosureIndex           → son yayın id'sini al
         2. GET /disclosures?disclosureIndex=n → özet liste (max 50 kayıt)
         3. Her kayıt için GET /disclosureDetail/{index}?fileType=html
            → şirket adı, hisse kodu, yayın tarihi, konu zenginleştirmesi
         4. DisclosureRaw listesi olarak döndür
+
+        since_index > 0 ise sadece o index'ten sonraki bildirimler çekilir.
+        Bu, her polling döngüsünde gereksiz API çağrısı yapılmasını engeller.
         """
         # Adım 1: Son index
         try:
@@ -158,14 +161,21 @@ class MKKProvider(BaseKAPProvider):
             log.warning("lastDisclosureIndex beklenen formatta değil: {}", idx_payload)
             return []
 
-        last_index = idx_payload["lastDisclosureIndex"]
+        last_index = int(idx_payload["lastDisclosureIndex"])
         log.info("KAP son bildirim index: {}", last_index)
 
+        # since_index verilmişse ve güncel index'e eşit/büyükse yeni bildirim yok
+        if since_index > 0 and since_index >= last_index:
+            log.info("Yeni bildirim yok (since_index={}, last_index={}).", since_index, last_index)
+            return []
+
         # Adım 2: Özet liste
-        # Not: /disclosures endpoint'i verilen index'ten itibaren (>=) döndüğü için
-        # son N bildirimi alabilmek adına biraz geriden başlamamız gerekiyor.
-        # Örn: limit=50 ise last_index-49'dan başlayarak çağırıyoruz.
-        start_index = max(0, int(last_index) - (limit - 1))
+        # since_index > 0 → sadece o index'ten sonrasını çek (API rate limit koruması)
+        # since_index = 0 → ilk çalışma; son limit kadar bildirimi geriden başlayarak çek
+        if since_index > 0:
+            start_index = since_index + 1
+        else:
+            start_index = max(0, last_index - (limit - 1))
         try:
             items = await self._get(
                 "/disclosures",
@@ -240,9 +250,11 @@ class MKKProvider(BaseKAPProvider):
             if not last_index:
                 return []
 
+            # Son 100 bildirimi geriden başlayarak çek (fetch_latest mantığıyla aynı)
+            start_index = max(0, int(last_index) - 99)
             items = await self._get(
                 "/disclosures",
-                params={"disclosureIndex": last_index, "companyId": [company_id]},
+                params={"disclosureIndex": start_index, "companyId": [company_id]},
             )
         except Exception as exc:
             log.error("fetch_by_stock_code başarısız (code={}): {}", code, exc)

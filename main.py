@@ -59,7 +59,10 @@ async def _fetch_and_classify() -> None:
     try:
         if _provider is None:
             _provider = get_provider()
-        raw_items: list[DisclosureRaw] = await _provider.fetch_latest(limit=100)
+        last_seen = await repo.get_last_seen_index()
+        raw_items: list[DisclosureRaw] = await _provider.fetch_latest(
+            limit=100, since_index=last_seen
+        )
     except Exception as exc:
         log.error("Provider hatası: {}", exc)
         return
@@ -123,9 +126,9 @@ async def lifespan(app: FastAPI):
     init_pool()
 
     # DB şemasını oluştur (eksik tablolar — IF NOT EXISTS, idempotent)
+    import asyncio
     async with get_connection() as conn:
-        import asyncio
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, create_tables, conn)
 
     # Provider ve ilk polling
@@ -139,6 +142,8 @@ async def lifespan(app: FastAPI):
     yield
 
     _scheduler.shutdown(wait=False)
+    if _provider is not None:
+        await _provider.close()
     close_pool()
     log.info("KAP Classifier kapatılıyor...")
 
