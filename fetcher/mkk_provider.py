@@ -142,7 +142,7 @@ class MKKProvider(BaseKAPProvider):
     async def fetch_latest(self, limit: int = 50, since_index: int = 0) -> list[DisclosureRaw]:
         """
         1. GET /lastDisclosureIndex           → son yayın id'sini al
-        2. GET /disclosures?disclosureIndex=n → özet liste (max 50 kayıt)
+        2. GET /disclosures?disclosureIndex=n → özet liste (max 50 kayıt döner)
         3. Her kayıt için GET /disclosureDetail/{index}?fileType=html
            → şirket adı, hisse kodu, yayın tarihi, konu zenginleştirmesi
         4. DisclosureRaw listesi olarak döndür
@@ -194,6 +194,9 @@ class MKKProvider(BaseKAPProvider):
             return []
 
         # Adım 3: Her bildirim için detay çek → zenginleştir
+        # MKK API tek seferde en fazla 50 bildirim döndürür.
+        # Eğer limit 50'den büyükse (örn: 500), API'nin döndürdüğü kadarını (max 50) işleriz.
+        # Bir sonraki polling döngüsünde (3 dk sonra) kalanlar çekilmeye devam eder.
         results: list[DisclosureRaw] = []
         batch = items[:limit]
         for raw_item in batch:

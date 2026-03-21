@@ -15,11 +15,13 @@ from fastapi.templating import Jinja2Templates
 
 import classifier.company as company_svc
 import classifier.news_type as news_svc
+from classifier.sentiment import analyze_sentiment, client as _openai_client
 import db.repository as repo
 from db.connection import init_pool, close_pool, get_connection
 from db.models import create_tables
 from fetcher.base_provider import BaseKAPProvider
 from fetcher.provider_factory import get_provider
+from fetcher.finance import get_current_price, get_price_at_time
 from models.disclosure import DisclosureClassified, DisclosureRaw
 from utils.logger import get_logger
 
@@ -61,7 +63,7 @@ async def _fetch_and_classify() -> None:
             _provider = get_provider()
         last_seen = await repo.get_last_seen_index()
         raw_items: list[DisclosureRaw] = await _provider.fetch_latest(
-            limit=100, since_index=last_seen
+            limit=500, since_index=last_seen
         )
     except Exception as exc:
         log.error("Provider hatası: {}", exc)
@@ -83,6 +85,28 @@ async def _fetch_and_classify() -> None:
                 news_category=news_svc.get_category_label(category),
                 company_slug=slug,
             )
+            
+            # LLM Duygu Analizi
+            sentiment_result = await analyze_sentiment(
+                classified.title,
+                classified.subject,
+                news_category=category,
+                disclosure_type=classified.disclosure_type,
+                full_text=classified.full_text,
+            )
+            if sentiment_result:
+                classified.sentiment = sentiment_result.sentiment
+                classified.sentiment_reason = sentiment_result.reason
+                
+            # Haber anı fiyatı
+            if classified.stock_codes:
+                # İlk hisse kodunu alalım (örn: "THYAO,THYAO2" -> "THYAO")
+                first_code = classified.stock_codes.split(",")[0].strip()
+                if first_code:
+                    price = await get_current_price(first_code)
+                    if price is not None:
+                        classified.price_at_news = price
+
         except Exception as exc:
             log.warning("Bildirim sınıflandırılamadı: {} — {}", raw.disclosure_index, exc)
             continue
@@ -113,6 +137,167 @@ async def _fetch_and_classify() -> None:
     log.info("Polling tamamlandı: {} yeni bildirim DB'ye eklendi.", new_count)
 
 
+async def _backfill_sentiment() -> None:
+    """
+    DB'de sentiment analizi yapılmamış (sentiment IS NULL) bildirimleri bulup
+    OpenAI API ile analiz eder. Her çalışmada en fazla 50 bildirimi işler.
+    Böylece uygulama yeniden başlatıldığında eski haberler tekrar analiz edilmez,
+    sadece eksik olanlar tamamlanır.
+    """
+    if not _openai_client:
+        return
+
+    try:
+        pending = await repo.get_disclosures_missing_sentiment(limit=50)
+        if not pending:
+            return
+
+        log.info("Sentiment backfill başladı: {} eksik kayıt işlenecek.", len(pending))
+        updated = 0
+
+        for disc in pending:
+            try:
+                category = news_svc.get_category_key(disc.news_category)
+                sentiment_result = await analyze_sentiment(
+                    disc.title,
+                    disc.subject,
+                    news_category=category,
+                    disclosure_type=disc.disclosure_type,
+                    full_text=disc.full_text,
+                )
+                if sentiment_result:
+                    await repo.update_sentiment(
+                        disc.disclosure_index,
+                        sentiment_result.sentiment,
+                        sentiment_result.reason,
+                    )
+                    updated += 1
+                else:
+                    # API yanıt verdı ama boş döndü — başarısız say
+                    await repo.mark_sentiment_failed(disc.disclosure_index)
+            except Exception as exc:
+                log.warning(
+                    "Backfill sentiment hatası (index={}): {}", disc.disclosure_index, exc
+                )
+                await repo.mark_sentiment_failed(disc.disclosure_index)
+
+        if updated > 0:
+            log.info("Sentiment backfill tamamlandı: {} kayıt güncellendi.", updated)
+
+    except Exception as exc:
+        log.error("Sentiment backfill genel hata: {}", exc)
+
+
+async def _backfill_full_text() -> None:
+    """
+    DB'de full_text alanı boş olan bildirimlerin tam içeriğini MKK API'den
+    yeniden çeker (htmlMessages Base64 decode), DB'ye yazar ve
+    sentiment'i sıfırlar ki backfill_sentiment tarafından yeniden analiz edilsin.
+    Her çalışmada en fazla 20 bildirimi işler.
+    """
+    global _provider
+    if _provider is None:
+        return
+
+    try:
+        pending = await repo.get_disclosures_missing_full_text(limit=20)
+        if not pending:
+            return
+
+        log.info("Full-text backfill başladı: {} eksik kayıt işlenecek.", len(pending))
+        updated = 0
+
+        for disc in pending:
+            try:
+                detail = await _provider._get(
+                    f"/disclosureDetail/{disc.disclosure_index}",
+                    params={"fileType": "html"},
+                )
+                if not isinstance(detail, dict):
+                    continue
+
+                # Geçici DisclosureRaw nesnesi üzerinden full_text hesapla
+                from models.disclosure import DisclosureRaw
+                tmp = DisclosureRaw(disclosureIndex=disc.disclosure_index)
+                tmp.enrich_from_detail(detail)
+
+                if tmp.full_text:
+                    await repo.update_full_text_and_reset_sentiment(
+                        disc.disclosure_index, tmp.full_text
+                    )
+                    updated += 1
+            except Exception as exc:
+                log.warning(
+                    "Full-text backfill hatası (index={}): {}", disc.disclosure_index, exc
+                )
+
+        if updated > 0:
+            log.info("Full-text backfill tamamlandı: {} kayıt güncellendi.", updated)
+
+    except Exception as exc:
+        log.error("Full-text backfill genel hata: {}", exc)
+
+
+
+    """
+    Eski bildirimlerin fiyatlarını (5dk, 1sa, 1g, 1h) günceller.
+    """
+    try:
+        disclosures = await repo.get_disclosures_needing_price_update()
+        if not disclosures:
+            return
+
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        updated_count = 0
+
+        for disc in disclosures:
+            if not disc.stock_codes or not disc.publish_datetime:
+                continue
+
+            pub_time = disc.publish_datetime
+            if pub_time.tzinfo is None:
+                pub_time = pub_time.replace(tzinfo=timezone.utc)
+
+            time_diff = now - pub_time
+            first_code = disc.stock_codes.split(",")[0].strip()
+            if not first_code:
+                continue
+
+            new_5m: float | None = None
+            new_1h: float | None = None
+            new_1d: float | None = None
+            new_1w: float | None = None
+
+            # 5 dakika
+            if disc.price_5m is None and time_diff >= timedelta(minutes=5):
+                new_5m = await get_price_at_time(first_code, pub_time + timedelta(minutes=5))
+
+            # 1 saat
+            if disc.price_1h is None and time_diff >= timedelta(hours=1):
+                new_1h = await get_price_at_time(first_code, pub_time + timedelta(hours=1))
+
+            # 1 gün
+            if disc.price_1d is None and time_diff >= timedelta(days=1):
+                new_1d = await get_price_at_time(first_code, pub_time + timedelta(days=1))
+
+            # 1 hafta
+            if disc.price_1w is None and time_diff >= timedelta(days=7):
+                new_1w = await get_price_at_time(first_code, pub_time + timedelta(days=7))
+
+            if any(p is not None for p in (new_5m, new_1h, new_1d, new_1w)):
+                await repo.update_prices(
+                    disc.disclosure_index, new_5m, new_1h, new_1d, new_1w
+                )
+                updated_count += 1
+
+        if updated_count > 0:
+            log.info("Fiyat güncellemesi tamamlandı: {} bildirimin fiyatı güncellendi.", updated_count)
+
+    except Exception as exc:
+        log.error("Fiyat güncelleme hatası: {}", exc)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -135,9 +320,23 @@ async def lifespan(app: FastAPI):
     _provider = get_provider()
     await _fetch_and_classify()
 
+    # DB'deki sentiment eksik kayıtları tamamla (başlangıçta bir kez)
+    await _backfill_sentiment()
+
+    # DB'deki full_text eksik kayıtları tamamla (başlangıçta bir kez)
+    await _backfill_full_text()
+
     _scheduler.add_job(_fetch_and_classify, "interval", minutes=3, id="kap_poll")
+    _scheduler.add_job(_update_prices, "interval", minutes=5, id="price_update")
+    _scheduler.add_job(_backfill_sentiment, "interval", minutes=10, id="sentiment_backfill")
+    _scheduler.add_job(_backfill_full_text, "interval", minutes=15, id="full_text_backfill")
     _scheduler.start()
-    log.info("APScheduler başlatıldı — her 3 dakikada bir polling.")
+    log.info(
+        "APScheduler başlatıldı — her 3 dakikada bir polling, "
+        "her 5 dakikada bir fiyat güncellemesi, "
+        "her 10 dakikada bir sentiment backfill, "
+        "her 15 dakikada bir full-text backfill."
+    )
 
     yield
 

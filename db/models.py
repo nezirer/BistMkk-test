@@ -34,7 +34,15 @@ _DDL_STATEMENTS: list[str] = [
         fund_id             VARCHAR(50),
         fund_code           VARCHAR(50),
         sub_report_ids      JSONB           DEFAULT '[]',
-        accepted_file_types JSONB           DEFAULT '[]'
+        accepted_file_types JSONB           DEFAULT '[]',
+        sentiment              VARCHAR(20),
+        sentiment_reason       VARCHAR(1000),
+        sentiment_failed_at    TIMESTAMPTZ,
+        price_at_news          NUMERIC(10, 4),
+        price_5m               NUMERIC(10, 4),
+        price_1h               NUMERIC(10, 4),
+        price_1d               NUMERIC(10, 4),
+        price_1w               NUMERIC(10, 4)
     )
     """,
     # kap_companies
@@ -76,6 +84,20 @@ _INDEX_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_comp_stock    ON kap_companies   (stock_code)",
 ]
 
+_MIGRATION_STATEMENTS: list[str] = [
+    # v3.1 — sentiment + fiyat sütunları: mevcut DB'lerde eksikse ekle
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS sentiment VARCHAR(20)",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS sentiment_reason VARCHAR(1000)",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS sentiment_failed_at TIMESTAMPTZ",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS price_at_news NUMERIC(10,4)",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS price_5m NUMERIC(10,4)",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS price_1h NUMERIC(10,4)",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS price_1d NUMERIC(10,4)",
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS price_1w NUMERIC(10,4)",
+    # v3.2 — tam bildirim metni (Base64 decode edilmiş htmlMessages)
+    "ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS full_text TEXT",
+]
+
 _SEED_STATEMENTS: list[str] = [
     """
     INSERT INTO kap_sync_state (state_key, state_value)
@@ -94,6 +116,9 @@ def create_tables(conn: psycopg2.extensions.connection) -> None:
             cur.execute(ddl.strip())
 
         for ddl in _INDEX_STATEMENTS:
+            cur.execute(ddl.strip())
+
+        for ddl in _MIGRATION_STATEMENTS:
             cur.execute(ddl.strip())
 
         for ddl in _SEED_STATEMENTS:

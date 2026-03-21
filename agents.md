@@ -6,7 +6,7 @@ KAP bildirimlerini otomatik olarak çekip şirket ve tür bazında sınıflandı
 ## Mimari Kararlar
 - **Şu an (v2):** PostgreSQL veritabanı aktif. OCI Compute Instance (Ubuntu 24.04 ARM64) üzerinde `invoice-db` adlı mevcut PostgreSQL Docker container'ına `kap_db` veritabanı ve `kap_user` eklendi.
 - **DB Katmanı:** `db/` klasörü — `connection.py` (psycopg2 havuzu), `models.py` (otomatik tablo oluşturma), `repository.py` (CRUD), `schema.sql` (el ile DDL)
-- **API limit koruması:** Her polling döngüsünde DB'deki son `disclosure_index`'ten itibaren yalnızca yeni bildirimler çekilir. Mevcut kayıtlar tekrar API'den sorgulanmaz.
+- **API limit koruması:** İlk açılışta son 500 bildirimden geriye doğru başlar (limit=500). MKK API'nin 50'lik limiti nedeniyle her 3 dakikada bir 50'şer çekerek geçmişi doldurur. Güncele yetiştikten sonra her polling döngüsünde DB'deki son `disclosure_index`'ten itibaren yalnızca yeni bildirimler çekilir. Mevcut kayıtlar tekrar API'den sorgulanmaz.
 - **Şirket listesi:** 24 saatlik TTL ile `kap_companies` tablosunda önbelleklenir, `/members` endpoint'i günde bir kez çağrılır.
 - **API:** Provider pattern (BaseKAPProvider) — bkz. fetcher/ klasörü
 - **Polling:** Her 3 dakikada bir yeni bildirimleri çek (APScheduler)
@@ -67,7 +67,14 @@ KAP bildirimlerini otomatik olarak çekip şirket ve tür bazında sınıflandı
 - **Bağlantı (sunucu):** Uygulama sunucuya taşındığında `PG_HOST=localhost` yapılır
 
 ## Gelecek Özellikler (v3+)
-- [ ] LLM ile otomatik özet ve sentiment analizi
+- [x] LLM ile otomatik özet ve sentiment analizi (OpenAI)
+- [x] yfinance ile haber sonrası hisse fiyatı değişimlerinin takibi (anlık, 5dk, 1sa, 1g, 1h)
 - [ ] Şirket bazlı alert sistemi
 - [ ] REST API endpoint'leri (dış kullanım için)
 - [ ] Şirket detayları (`/memberDetail/{id}`) DB'ye önbellekleme
+
+## LLM ve Finans Entegrasyonu (v3)
+- **LLM:** OpenAI API kullanılarak `classifier/sentiment.py` üzerinden haberlerin duygu analizi (Olumlu, Olumsuz, Nötr) yapılır.
+- **Finans:** `yfinance` kütüphanesi kullanılarak `fetcher/finance.py` üzerinden haber anı ve sonrasındaki fiyat değişimleri takip edilir.
+- **Veritabanı:** `kap_disclosures` tablosuna `sentiment`, `sentiment_reason` ve fiyat takibi için `price_at_news`, `price_5m`, `price_1h`, `price_1d`, `price_1w` sütunları eklenmiştir.
+- **Zamanlanmış Görevler:** `main.py` içinde yeni haberler çekildiğinde asenkron LLM analizi tetiklenir ve belirli aralıklarla eski haberler için fiyat güncellemeleri yapılır.

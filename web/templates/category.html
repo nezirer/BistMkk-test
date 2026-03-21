@@ -38,7 +38,8 @@
           <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Tarih</th>
           <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Şirket</th>
           <th class="px-4 py-3 text-left font-semibold text-gray-600">Başlık</th>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Konu</th>
+          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Duygu</th>
+          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Fiyat Etkisi</th>
           <th class="px-4 py-3 text-center font-semibold text-gray-600 whitespace-nowrap">KAP</th>
         </tr>
       </thead>
@@ -54,10 +55,55 @@
             <div class="text-xs text-gray-400 truncate max-w-[140px]">{{ d.company_name }}</div>
           </td>
           <td class="px-4 py-3 text-gray-700 max-w-xs">
-            <span class="line-clamp-2">{{ d.title or '—' }}</span>
+            <span class="line-clamp-2" title="{{ d.subject }}">{{ d.title or d.subject or '—' }}</span>
           </td>
-          <td class="px-4 py-3 text-gray-500 max-w-xs text-xs">
-            <span class="line-clamp-2">{{ d.subject or '—' }}</span>
+          <td class="px-4 py-3 whitespace-nowrap">
+            {% if d.sentiment == 'Olumlu' %}
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800" title="{{ d.sentiment_reason }}">
+                Olumlu
+              </span>
+            {% elif d.sentiment == 'Olumsuz' %}
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800" title="{{ d.sentiment_reason }}">
+                Olumsuz
+              </span>
+            {% elif d.sentiment == 'Nötr' %}
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800" title="{{ d.sentiment_reason }}">
+                Nötr
+              </span>
+            {% else %}
+              <span class="text-xs text-gray-400">—</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-3 whitespace-nowrap text-xs">
+            {% if d.price_at_news %}
+              <div class="text-gray-600">Anlık: {{ "%.2f"|format(d.price_at_news) }} ₺</div>
+              {% if d.price_5m %}
+                {% set diff = ((d.price_5m - d.price_at_news) / d.price_at_news) * 100 %}
+                <div class="{% if diff > 0 %}text-green-600{% elif diff < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
+                  5dk: {{ "%.2f"|format(d.price_5m) }} ({{ "%+.2f"|format(diff) }}%)
+                </div>
+              {% endif %}
+              {% if d.price_1h %}
+                {% set diff = ((d.price_1h - d.price_at_news) / d.price_at_news) * 100 %}
+                <div class="{% if diff > 0 %}text-green-600{% elif diff < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
+                  1sa: {{ "%.2f"|format(d.price_1h) }} ({{ "%+.2f"|format(diff) }}%)
+                </div>
+              {% endif %}
+              {% if d.price_1d %}
+                {% set diff = ((d.price_1d - d.price_at_news) / d.price_at_news) * 100 %}
+                <div class="{% if diff > 0 %}text-green-600{% elif diff < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
+                  1g: {{ "%.2f"|format(d.price_1d) }} ({{ "%+.2f"|format(diff) }}%)
+                </div>
+              {% endif %}
+              {% if d.price_1w %}
+                {% set diff = ((d.price_1w - d.price_at_news) / d.price_at_news) * 100 %}
+                <div class="{% if diff > 0 %}text-green-600{% elif diff < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
+                  1h: {{ "%.2f"|format(d.price_1w) }} ({{ "%+.2f"|format(diff) }}%)
+                </div>
+              {% endif %}
+            {% else %}
+              <span class="text-gray-400">—</span>
+            {% endif %}
           </td>
           <td class="px-4 py-3 text-center">
             <a href="https://www.kap.org.tr/tr/Bildirim/{{ d.disclosure_index }}"

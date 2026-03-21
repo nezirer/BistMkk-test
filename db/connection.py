@@ -56,8 +56,8 @@ def init_pool() -> None:
         )
 
     _pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=1,
-        maxconn=5,
+        minconn=2,
+        maxconn=10,
         host=s.pg_host,
         port=s.pg_port,
         dbname=s.pg_db,

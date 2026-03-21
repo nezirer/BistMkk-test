@@ -92,3 +92,12 @@ def classify(disclosure: DisclosureRaw) -> str:
 def get_category_label(category_key: str) -> str:
     """Kategori anahtarını insan okunabilir Türkçe etikete çevirir."""
     return CATEGORY_LABELS.get(category_key, "Diğer")
+
+
+# Ters eşleme: label → key (backfill sentiment için)
+_LABEL_TO_KEY: dict[str, str] = {v: k for k, v in CATEGORY_LABELS.items()}
+
+
+def get_category_key(category_label: str) -> str:
+    """İnsan okunabilir etiketten kategori anahtarını döndürür (backfill için)."""
+    return _LABEL_TO_KEY.get(category_label, "diger")

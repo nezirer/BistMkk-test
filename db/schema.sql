@@ -31,7 +31,15 @@ CREATE TABLE IF NOT EXISTS kap_disclosures (
     fund_id             VARCHAR(50),
     fund_code           VARCHAR(50),
     sub_report_ids      JSONB           DEFAULT '[]',
-    accepted_file_types JSONB           DEFAULT '[]'
+    accepted_file_types JSONB           DEFAULT '[]',
+    sentiment              VARCHAR(20),
+    sentiment_reason       VARCHAR(1000),
+    sentiment_failed_at    TIMESTAMPTZ,
+    price_at_news          NUMERIC(10, 4),
+    price_5m            NUMERIC(10, 4),
+    price_1h            NUMERIC(10, 4),
+    price_1d            NUMERIC(10, 4),
+    price_1w            NUMERIC(10, 4)
 );
 
 CREATE INDEX IF NOT EXISTS idx_disc_stock    ON kap_disclosures (stock_codes);
@@ -79,3 +87,7 @@ CREATE TABLE IF NOT EXISTS kap_sync_state (
 INSERT INTO kap_sync_state (state_key, state_value)
 VALUES ('last_disclosure_index', '0')
 ON CONFLICT (state_key) DO NOTHING;
+
+-- Migration: mevcut DB'lerde sentiment_failed_at sütunu yoksa ekle
+ALTER TABLE kap_disclosures
+    ADD COLUMN IF NOT EXISTS sentiment_failed_at TIMESTAMPTZ;

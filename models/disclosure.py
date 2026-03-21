@@ -12,10 +12,12 @@ Modeller:
 
 from __future__ import annotations
 
+import base64
 import re
 from datetime import datetime
 from typing import Any
 
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -116,6 +118,14 @@ class DisclosureRaw(BaseModel):
         alias="kapLink",
         description="KAP sayfasındaki bildirim bağlantısı (link alanından gelir)",
     )
+    full_text: str = Field(
+        default="",
+        alias="fullText",
+        description=(
+            "Bildirimin tam metni: summary.tr + htmlMessages Base64 decode "
+            "edilip HTML striplenerek elde edilir. Sentiment analizi için kullanılır."
+        ),
+    )
 
     model_config = {
         "populate_by_name": True,
@@ -169,6 +179,8 @@ class DisclosureRaw(BaseModel):
           subject.tr       → subject
           year             → year
           link             → kap_link
+          summary.tr       → full_text'e eklenir
+          htmlMessages[].tr → Base64 decode + HTML strip → full_text'e eklenir
         """
         self.company_name = detail.get("senderTitle", "") or ""
 
@@ -185,6 +197,37 @@ class DisclosureRaw(BaseModel):
 
         self.year = str(detail.get("year", "")) or ""
         self.kap_link = detail.get("link", "") or ""
+
+        # --- full_text: summary + htmlMessages içeriği ---
+        text_parts: list[str] = []
+
+        summary_obj = detail.get("summary")
+        if isinstance(summary_obj, dict):
+            summary_tr = (summary_obj.get("tr") or "").strip()
+            if summary_tr:
+                text_parts.append(summary_tr)
+        elif isinstance(summary_obj, str) and summary_obj.strip():
+            text_parts.append(summary_obj.strip())
+
+        for msg in detail.get("htmlMessages", []) or []:
+            b64 = (msg.get("tr") or "").strip() if isinstance(msg, dict) else ""
+            if not b64:
+                continue
+            try:
+                raw_bytes = base64.b64decode(b64)
+                try:
+                    html = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    html = raw_bytes.decode("iso-8859-9", errors="replace")
+                soup = BeautifulSoup(html, "html.parser")
+                plain = soup.get_text(separator=" ", strip=True)
+                plain = re.sub(r"\s{2,}", " ", plain).strip()
+                if plain:
+                    text_parts.append(plain)
+            except Exception:
+                pass
+
+        self.full_text = "\n\n".join(text_parts)[:8000]
 
 
 class DisclosureClassified(DisclosureRaw):
@@ -214,6 +257,34 @@ class DisclosureClassified(DisclosureRaw):
     classified_at: datetime = Field(
         default_factory=datetime.utcnow,
         description="Sınıflandırmanın gerçekleştirildiği UTC zaman damgası",
+    )
+    sentiment: str | None = Field(
+        default=None,
+        description="LLM tarafından belirlenen duygu (Olumlu, Olumsuz, Nötr)",
+    )
+    sentiment_reason: str | None = Field(
+        default=None,
+        description="LLM'in duygu analizi için kısa açıklaması",
+    )
+    price_at_news: float | None = Field(
+        default=None,
+        description="Haber anındaki hisse fiyatı",
+    )
+    price_5m: float | None = Field(
+        default=None,
+        description="Haberden 5 dakika sonraki hisse fiyatı",
+    )
+    price_1h: float | None = Field(
+        default=None,
+        description="Haberden 1 saat sonraki hisse fiyatı",
+    )
+    price_1d: float | None = Field(
+        default=None,
+        description="Haberden 1 gün sonraki hisse fiyatı",
+    )
+    price_1w: float | None = Field(
+        default=None,
+        description="Haberden 1 hafta sonraki hisse fiyatı",
     )
 
     @model_validator(mode="after")
