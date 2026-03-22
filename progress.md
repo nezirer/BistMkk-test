@@ -68,13 +68,31 @@
 - [x] Sentiment backfill mekanizması: DB'deki sentiment=NULL kayıtlar yeniden analiz edilir; zaten analiz edilmiş haberlere dokunulmaz. Başlangıçta bir kez + her 10 dakikada bir çalışır.
 - [ ] Şirket bazlı alert / bildirim sistemi
 - [ ] REST API dokümantasyonu (OpenAPI genişletme)
-- [ ] Sayfalama (pagination) desteği web arayüzünde
+- [x] Sayfalama (pagination) desteği web arayüzünde
 - [ ] Şirket detayları (`/memberDetail/{id}`) DB'ye önbellekleme
+
+## ✅ Tamamlananlar (v4 — Web Ürün Haline Getirme)
+- [x] `db/repository.py`: `count_disclosures()`, `get_disclosure_by_index()`, `get_stats()`, `count_companies()` fonksiyonları eklendi; `get_disclosures()` ve `get_companies()`'e `search_query` + sayfalama parametreleri eklendi
+- [x] `main.py`: `PAGE_SIZE=50` sabiti; tüm HTML endpoint'lerine `page` query param + sayfalama; `/disclosure/{index}` (bildirim detay), `/companies` (şirket listesi), `/api/stats` yeni endpoint'leri; `/api/disclosures`'a `q` search param eklendi
+- [x] `web/templates/base.html`: Marka "KAP Sinyal" olarak güncellendi; navbar'a arama çubuğu + /companies linki eklendi; "MVP" yazısı footer'dan kaldırıldı; sticky navbar; tıklanabilir satır JS desteği
+- [x] `web/templates/index.html`: 4 istatistik kartı (toplam bildirim, son 24 saat, olumlu/olumsuz oran); arama + sayfalama; renkli kategori badge'leri; tıklanabilir satırlar; fiyat değişimleri yüzde olarak gösteriliyor
+- [x] `web/templates/disclosure.html` (YENİ): Bildirim detay sayfası — başlık kartı, sentiment açıklaması, fiyat hareketi şeridi (Yayın→5dk→1sa→1g→1h), full_text HTML render, ek dosyalar, meta bilgiler, ilgili bildirimler
+- [x] `web/templates/companies.html` (YENİ): BIST şirket listesi — arama + sayfalama (50/sayfa)
+- [x] `web/templates/company.html`: Sayfalama + tıklanabilir satırlar + renkli badge'ler + modern tasarım
+- [x] `web/templates/category.html`: Sayfalama + tıklanabilir satırlar + renkli badge'ler + modern tasarım
 
 ---
 ## ⚠️ Kritik Değişiklik
 - [x] Eski kap.org.tr scraping yaklaşımı KALDIRILDI
 - [x] Yeni provider mimarisi kuruldu (bkz. ADIM 2)
+
+## ✅ Tamamlananlar (v3.4 — publish_datetime_utc + Tam Sistem Testi)
+- [x] `publish_date` parse formatına `%d.%m.%Y %H:%M:%S` (saniyeli) eklendi — DB'deki tüm tarihlerin UTC'ye çevrilmesini engelleyen bug düzeltildi
+- [x] `publish_datetime_utc` backfill: 100 kayıt başarıyla güncellendi
+- [x] `price_at_news` backfill: 18 yeni kayıt daha güncellendi (toplam 39)
+- [x] Tüm yeni DB sütunları migration ile otomatik oluşturuldu: `attachment_urls`, `related_disclosure_index`, `period`, `related_stocks`, `publish_datetime_utc`
+- [x] `pdf_link` veritabanı sütunu eklendi. KAP bildirimlerinde ek dosya (özellikle PDF) varsa, ilk dosyanın URL'si doğrudan `pdf_link` alanına kaydediliyor ve arayüzde "PDF İndir" butonu olarak gösteriliyor.
+- [x] Tam sistem testi başarılı: PostgreSQL bağlantı, MKK API polling, sentiment analizi, fiyat backfill, web UI, JSON API
 
 ## Notlar
 _10.03.2026 — MVP tamamlandı. Tüm sınıflandırma, polling ve web UI görevleri çalışır durumda._
@@ -95,3 +113,16 @@ _12.03.2026 — Uçtan uca test başarılı. PostgreSQL kap_db'ye bağlantı kur
 _21.03.2026 — Sentiment backfill mekanizması eklendi: `_backfill_sentiment()` fonksiyonu DB'de `sentiment IS NULL` olan bildirimleri bulup OpenAI API ile analiz eder. Zaten analiz edilmiş (sentiment dolu) haberlere hiç dokunmaz. Uygulama başlangıcında bir kez + her 10 dakikada bir scheduler ile çalışır. `db/repository.py`'e `get_disclosures_missing_sentiment()`, `classifier/news_type.py`'e `get_category_key()` eklendi._
 _21.03.2026 — 5 kritik hata düzeltildi: (1) OpenAI model adı `gpt-5.4-nano` → `gpt-4.1-nano-2025-04-14` düzeltildi (geçersiz model adı sentiment özelliğini tamamen devre dışı bırakıyordu). (2) `kap_disclosures` tablosuna `sentiment_failed_at TIMESTAMPTZ` sütunu eklendi; başarısız olan sentiment işlemleri bu alanla işaretleniyor, `get_disclosures_missing_sentiment()` artık `sentiment_failed_at IS NULL` koşulunu da kontrol ederek sonsuz retry döngüsü önleniyor. (3) `_backfill_sentiment` ve `_update_prices` fonksiyonları `upsert_disclosure` yerine hedefli `update_sentiment()` / `update_prices()` sorgularını kullanıyor — gereksiz tam kayıt yazımı kaldırıldı. (4) `get_disclosures_needing_price_update()` sorgusuna `classified_at >= NOW() - INTERVAL '8 days'` filtresi eklendi; hiçbir zaman fiyat alınamayacak eski kayıtların sonsuz döngüye girmesi engellendi. (5) PostgreSQL bağlantı havuzu boyutu `maxconn=5` → `maxconn=10` olarak artırıldı._
 _12.03.2026 — Kritik bug düzeltmeleri (7 adet): (1) fetch_latest() artık DB'deki last_seen_index parametresini alarak sadece yeni bildirimleri çekiyor — her polling döngüsündeki 100 gereksiz HTTP isteği engellendi. (2) stock_codes filtresi exact match → ILIKE ile çoklu kodlu bildirimlerde şirket sayfası boş görünme hatası giderildi. (3) MockProvider.fetch_companies() yanlış dict anahtarları ("code"/"name") → doğru anahtarlar ("id"/"title"/"stockCode") — mock modunda şirketlerin DB'ye kaydedilmemesi hatası giderildi. (4) company.py update_registry() / get_company_slug() boş stock_codes için geçersiz "" anahtarla kayıt oluşturma hatası giderildi. (5) asyncio.get_event_loop() → get_running_loop() (Python 3.10+ DeprecationWarning/RuntimeError riski). (6) httpx.AsyncClient lifespan sonunda kapatılmıyor (kaynak sızıntısı) — provider.close() lifespan shutdown'a eklendi. (7) fetch_by_stock_code() disclosureIndex=last_index yanlış — start_index=last_index-99 ile son 100 bildirimi kapsıyor._
+_22.03.2026 — KAP verilerinin formatını incelemek amacıyla `sandbox_fetch.py` betiği oluşturuldu ve MKK API üzerinden 5 adet örnek bildirim çekilerek `ornek.json` dosyasına kaydedildi._
+_22.03.2026 — MKK API'den gelen 4 yeni alan veritabanına ve modele eklendi: `attachment_urls` (bildirim ek dosyaları, JSONB), `related_disclosure_index` (ilişkili bildirim index'i, VARCHAR(50)), `period` (dönem bilgisi, VARCHAR(200)), `related_stocks` (ilişkili hisse kodları, JSONB). Değişiklikler: `models/disclosure.py` (Pydantic model + `enrich_from_detail` parse), `db/schema.sql` (CREATE TABLE + ALTER TABLE migration), `db/models.py` (DDL + migration), `db/repository.py` (INSERT/UPDATE sorguları + tüm SELECT sorguları güncellendi, tekrar eden row→object dönüşüm kodu `_row_to_disclosure()` yardımcı fonksiyonuyla merkezileştirildi). Ayrıca `repository.py`'deki kırık `update_last_seen_index()` fonksiyon imzası düzeltildi.
+_22.03.2026 — **Fiyat hesaplama mimarisi yeniden yazıldı: yayınlanma tarihine dayalı (publish_datetime_utc) sistem.**
+  - **Problem:** `price_at_news` bildirimin çekildiği an'ın fiyatını alıyordu (`get_current_price()`), bildirimin yayınlanma tarihi ile çekilme tarihi farklı olabildiğinden yanlış fiyatlar kaydediliyordu. `_update_prices` fonksiyonu da yanlışlıkla `_backfill_full_text()` içinde sahipsiz kod bloğu olarak kalmıştı (NameError).
+  - **Çözüm:**
+    1. DB'ye `publish_datetime_utc TIMESTAMPTZ` sütunu eklendi (migration: v3.4). KAP bildirimi yayınlanma zamanı Türkiye saatinden (UTC+3) UTC'ye çevrilerek saklanıyor.
+    2. `models/disclosure.py`: `publish_datetime_utc` alanı + `_parse_publish_datetime_utc()` metodu eklendi. `enrich_from_detail()` sonunda otomatik doldurma.
+    3. `fetcher/finance.py`: `get_price_at_publish()` fonksiyonu eklendi — yayınlanma gününün kapanış fiyatını veya son 7 gün içindeyse 5dk intraday en yakın fiyatı döndürür.
+    4. `main.py / _fetch_and_classify()`: `get_current_price()` → `get_price_at_publish(publish_datetime_utc)` ile değiştirildi.
+    5. `main.py / _update_prices()`: Sahipsiz kod bloğu düzgün `async def` fonksiyonuna çevrildi; `publish_datetime` property yerine `publish_datetime_utc` DB sütunu kullanılıyor.
+    6. `main.py / _backfill_publish_datetime()`: Mevcut kayıtların (a) `publish_datetime_utc` parse + (b) `price_at_news` yayınlanma tarihine göre backfill mekanizması. Başlangıçta bir kez + her 10 dakikada bir çalışır.
+    7. `db/repository.py`: `update_publish_datetime_utc()`, `get_disclosures_missing_publish_datetime()`, `get_disclosures_needing_price_at_news()`, `update_price_at_news()` fonksiyonları eklendi. `upsert_disclosure` ve `_row_to_disclosure` güncellendi._
+_22.03.2026 — **Web ürün haline getirildi (v4).** MVP arayüzü tamamen yeniden yazıldı: (1) Marka "KAP Sinyal" olarak güncellendi. (2) Ana sayfaya 4 istatistik kartı (toplam bildirim, son 24 saat, olumlu/olumsuz oran) eklendi. (3) Tüm sayfalara sayfalama (50/sayfa) ve arama desteği eklendi. (4) Yeni `/disclosure/{index}` bildirim detay sayfası: fiyat hareketi şeridi, full_text HTML render, AI sentiment açıklaması, ek dosyalar, ilgili bildirimler. (5) Yeni `/companies` şirket listesi sayfası: 1014 şirketi arama+sayfalama ile listeler. (6) Renkli kategori badge'leri (mavi=finansal, mor=özel durum, yeşil=temettü vb.). (7) Tüm tablo satırları tıklanabilir (detay sayfasına yönlendirir). (8) `/api/stats` ve `/api/disclosures?q=` yeni endpoint'leri eklendi. DB fonksiyonları: `count_disclosures()`, `get_disclosure_by_index()`, `get_stats()`, `count_companies()`, `search_query` parametreli sorgular._

@@ -57,6 +57,69 @@ async def get_current_price(stock_code: str) -> Optional[float]:
         log.error(f"Fiyat çekilirken hata ({ticker_symbol}): {e}")
         return None
 
+async def get_price_at_publish(stock_code: str, publish_utc: datetime) -> Optional[float]:
+    """
+    Bildirimin yayınlanma tarihindeki (publish_datetime_utc) fiyatı çeker.
+
+    Strateji:
+    - Yayınlanma gününün kapanış fiyatını döndürür (en güvenilir yöntem).
+    - Eğer yayınlanma günü hafta sonu / tatilse, bir önceki işlem gününün
+      kapanış fiyatı döner (yfinance bunu otomatik yapar).
+    - Son 7 gün içindeki bildirimler için 5dk intraday veriyle
+      en yakın zaman noktası bulunabilir.
+    """
+    if not stock_code or not publish_utc:
+        return None
+
+    ticker_symbol = _get_bist_ticker(stock_code)
+
+    if publish_utc.tzinfo is None:
+        publish_utc = publish_utc.replace(tzinfo=timezone.utc)
+
+    publish_istanbul = publish_utc.astimezone(BIST_TZ)
+
+    now = datetime.now(timezone.utc)
+    days_diff = (now - publish_utc).days
+
+    loop = asyncio.get_running_loop()
+    try:
+        ticker = await loop.run_in_executor(None, yf.Ticker, ticker_symbol)
+
+        if days_diff <= 6:
+            start_date = (publish_istanbul - timedelta(hours=1)).strftime("%Y-%m-%d")
+            end_date = (publish_istanbul + timedelta(days=1)).strftime("%Y-%m-%d")
+            history = await loop.run_in_executor(
+                None,
+                lambda: ticker.history(start=start_date, end=end_date, interval="5m"),
+            )
+            if not history.empty:
+                target_local = publish_utc.astimezone(history.index.tz)
+                time_diffs = abs(history.index - target_local)
+                closest_idx = time_diffs.argmin()
+                return float(history["Close"].iloc[closest_idx])
+
+        start_date = (publish_istanbul - timedelta(days=3)).strftime("%Y-%m-%d")
+        end_date = (publish_istanbul + timedelta(days=2)).strftime("%Y-%m-%d")
+        history = await loop.run_in_executor(
+            None,
+            lambda: ticker.history(start=start_date, end=end_date),
+        )
+        if not history.empty:
+            pub_date_str = publish_istanbul.strftime("%Y-%m-%d")
+            if pub_date_str in history.index.strftime("%Y-%m-%d"):
+                mask = history.index.strftime("%Y-%m-%d") == pub_date_str
+                return float(history.loc[mask, "Close"].iloc[0])
+            before = history[history.index.date <= publish_istanbul.date()]
+            if not before.empty:
+                return float(before["Close"].iloc[-1])
+            return float(history["Close"].iloc[0])
+
+        return None
+    except Exception as e:
+        log.error(f"Yayın fiyatı çekilirken hata ({ticker_symbol} - {publish_utc}): {e}")
+        return None
+
+
 async def get_price_at_time(stock_code: str, target_time: datetime) -> Optional[float]:
     """
     Belirtilen hisse senedinin belirli bir zamandaki fiyatını çeker.

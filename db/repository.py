@@ -32,6 +32,61 @@ def _slugify(text: str) -> str:
     return text.strip("-")
 
 
+_DISCLOSURE_COLUMNS = """
+    disclosure_index, disclosure_type, disclosure_class, title,
+    company_id, company_name, stock_codes, publish_date, subject,
+    year_info, kap_link, news_category, company_slug, classified_at,
+    fund_id, fund_code, sub_report_ids, accepted_file_types,
+    sentiment, sentiment_reason, price_at_news, price_5m, price_1h, price_1d, price_1w,
+    full_text,
+    attachment_urls, related_disclosure_index, period, related_stocks,
+    publish_datetime_utc, pdf_link
+"""
+
+
+def _row_to_disclosure(row: tuple) -> DisclosureClassified:
+    sub_ids = row[16] if isinstance(row[16], list) else []
+    acc_types = row[17] if isinstance(row[17], list) else []
+    classified_at = row[13] if isinstance(row[13], datetime) else datetime.utcnow()
+    att_urls = row[26] if isinstance(row[26], list) else []
+    rel_stocks = row[29] if isinstance(row[29], list) else []
+
+    return DisclosureClassified(
+        disclosureIndex=int(row[0]),
+        disclosureType=row[1] or "",
+        disclosureClass=row[2] or "",
+        title=row[3] or "",
+        companyId=row[4] or "",
+        companyName=row[5] or "",
+        stockCodes=row[6] or "",
+        publishDate=row[7] or "",
+        subject=row[8] or "",
+        year=row[9] or "",
+        kapLink=row[10] or "",
+        newsCategory=row[11] or "",
+        companySlug=row[12] or "",
+        classified_at=classified_at,
+        fundId=row[14] or "",
+        fundCode=row[15] or "",
+        subReportIds=sub_ids,
+        acceptedDataFileTypes=acc_types,
+        sentiment=row[18],
+        sentiment_reason=row[19],
+        price_at_news=float(row[20]) if row[20] is not None else None,
+        price_5m=float(row[21]) if row[21] is not None else None,
+        price_1h=float(row[22]) if row[22] is not None else None,
+        price_1d=float(row[23]) if row[23] is not None else None,
+        price_1w=float(row[24]) if row[24] is not None else None,
+        fullText=row[25] or "",
+        attachmentUrls=att_urls,
+        relatedDisclosureIndex=row[27] or "",
+        period=row[28] or "",
+        relatedStocks=rel_stocks,
+        publishDatetimeUtc=row[30] if len(row) > 30 else None,
+        pdfLink=row[31] if len(row) > 31 else "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bildirim (Disclosure) işlemleri
 # ---------------------------------------------------------------------------
@@ -60,14 +115,18 @@ def _upsert_disclosure_sync(
                 year_info, kap_link, news_category, company_slug, classified_at,
                 fund_id, fund_code, sub_report_ids, accepted_file_types,
                 sentiment, sentiment_reason, price_at_news, price_5m, price_1h, price_1d, price_1w,
-                full_text
+                full_text,
+                attachment_urls, related_disclosure_index, period, related_stocks,
+                publish_datetime_utc, pdf_link
             ) VALUES (
                 %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s::jsonb, %s::jsonb,
                 %s, %s, %s, %s, %s, %s, %s,
-                %s
+                %s,
+                %s::jsonb, %s, %s, %s::jsonb,
+                %s, %s
             )
             ON CONFLICT (disclosure_index) DO UPDATE SET
                 disclosure_type      = EXCLUDED.disclosure_type,
@@ -89,7 +148,13 @@ def _upsert_disclosure_sync(
                 price_5m             = COALESCE(EXCLUDED.price_5m, kap_disclosures.price_5m),
                 price_1h             = COALESCE(EXCLUDED.price_1h, kap_disclosures.price_1h),
                 price_1d             = COALESCE(EXCLUDED.price_1d, kap_disclosures.price_1d),
-                price_1w             = COALESCE(EXCLUDED.price_1w, kap_disclosures.price_1w)
+                price_1w             = COALESCE(EXCLUDED.price_1w, kap_disclosures.price_1w),
+                attachment_urls      = COALESCE(EXCLUDED.attachment_urls, kap_disclosures.attachment_urls),
+                related_disclosure_index = COALESCE(EXCLUDED.related_disclosure_index, kap_disclosures.related_disclosure_index),
+                period               = COALESCE(EXCLUDED.period, kap_disclosures.period),
+                related_stocks       = COALESCE(EXCLUDED.related_stocks, kap_disclosures.related_stocks),
+                publish_datetime_utc = COALESCE(EXCLUDED.publish_datetime_utc, kap_disclosures.publish_datetime_utc),
+                pdf_link             = COALESCE(EXCLUDED.pdf_link, kap_disclosures.pdf_link)
             """,
             (
                 d.disclosure_index,
@@ -118,6 +183,12 @@ def _upsert_disclosure_sync(
                 getattr(d, "price_1d", None),
                 getattr(d, "price_1w", None),
                 (d.full_text or "") or None,
+                json.dumps(d.attachment_urls or [], ensure_ascii=False),
+                (d.related_disclosure_index or "")[:50] or None,
+                (d.period or "")[:200] or None,
+                json.dumps(d.related_stocks or [], ensure_ascii=False),
+                getattr(d, "publish_datetime_utc", None),
+                (d.pdf_link or "")[:2000] or None,
             ),
         )
 
@@ -145,17 +216,19 @@ async def get_disclosures(
     stock_code: str = "",
     category: str = "",
     offset: int = 0,
+    search_query: str = "",
 ) -> list[DisclosureClassified]:
     """
     DB'den sıralı bildirim listesi döndürür.
     - stock_code filtresi: stock_codes ILIKE (kısmi eşleşme, çoklu kodları destekler)
     - category filtresi: news_category exact match
+    - search_query filtresi: title veya subject ILIKE
     - Sıralama: disclosure_index DESC (en yeni önce)
     """
     async with get_connection() as conn:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, _get_disclosures_sync, conn, limit, stock_code, category, offset
+            None, _get_disclosures_sync, conn, limit, stock_code, category, offset, search_query
         )
 
 
@@ -165,13 +238,12 @@ def _get_disclosures_sync(
     stock_code: str,
     category: str,
     offset: int,
+    search_query: str = "",
 ) -> list[DisclosureClassified]:
     where_clauses: list[str] = []
     params: list[Any] = []
 
     if stock_code:
-        # stock_codes virgülle ayrılmış çoklu kod içerebilir (örn: "THYAO,THYAO2")
-        # Exact match yerine ILIKE ile kısmi eşleşme yapılır
         where_clauses.append("stock_codes ILIKE %s")
         params.append(f"%{stock_code.upper()}%")
 
@@ -179,19 +251,18 @@ def _get_disclosures_sync(
         where_clauses.append("news_category = %s")
         params.append(category)
 
+    if search_query:
+        where_clauses.append("(title ILIKE %s OR subject ILIKE %s OR stock_codes ILIKE %s)")
+        q = f"%{search_query}%"
+        params.extend([q, q, q.upper()])
+
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     params.extend([limit, offset])
 
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT
-                disclosure_index, disclosure_type, disclosure_class, title,
-                company_id, company_name, stock_codes, publish_date, subject,
-                year_info, kap_link, news_category, company_slug, classified_at,
-                fund_id, fund_code, sub_report_ids, accepted_file_types,
-                sentiment, sentiment_reason, price_at_news, price_5m, price_1h, price_1d, price_1w,
-                full_text
+            SELECT {_DISCLOSURE_COLUMNS}
             FROM kap_disclosures
             {where_sql}
             ORDER BY disclosure_index DESC
@@ -204,40 +275,7 @@ def _get_disclosures_sync(
     results: list[DisclosureClassified] = []
     for row in rows:
         try:
-            # sub_report_ids ve accepted_file_types JSONB olarak gelir (zaten list)
-            sub_ids = row[16] if isinstance(row[16], list) else []
-            acc_types = row[17] if isinstance(row[17], list) else []
-            classified_at = row[13] if isinstance(row[13], datetime) else datetime.utcnow()
-
-            disc = DisclosureClassified(
-                disclosureIndex=int(row[0]),
-                disclosureType=row[1] or "",
-                disclosureClass=row[2] or "",
-                title=row[3] or "",
-                companyId=row[4] or "",
-                companyName=row[5] or "",
-                stockCodes=row[6] or "",
-                publishDate=row[7] or "",
-                subject=row[8] or "",
-                year=row[9] or "",
-                kapLink=row[10] or "",
-                newsCategory=row[11] or "",
-                companySlug=row[12] or "",
-                classified_at=classified_at,
-                fundId=row[14] or "",
-                fundCode=row[15] or "",
-                subReportIds=sub_ids,
-                acceptedDataFileTypes=acc_types,
-                sentiment=row[18],
-                sentiment_reason=row[19],
-                price_at_news=float(row[20]) if row[20] is not None else None,
-                price_5m=float(row[21]) if row[21] is not None else None,
-                price_1h=float(row[22]) if row[22] is not None else None,
-                price_1d=float(row[23]) if row[23] is not None else None,
-                price_1w=float(row[24]) if row[24] is not None else None,
-                fullText=row[25] or "",
-            )
-            results.append(disc)
+            results.append(_row_to_disclosure(row))
         except Exception as exc:
             log.warning(
                 "DB satırı DisclosureClassified'a dönüştürülemedi (index={}): {}",
@@ -245,6 +283,163 @@ def _get_disclosures_sync(
             )
 
     return results
+
+
+async def count_disclosures(
+    stock_code: str = "",
+    category: str = "",
+    search_query: str = "",
+) -> int:
+    """Filtreli bildirim sayısını döndürür (sayfalama için)."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _count_disclosures_sync, conn, stock_code, category, search_query
+        )
+
+
+def _count_disclosures_sync(
+    conn: psycopg2.extensions.connection,
+    stock_code: str,
+    category: str,
+    search_query: str,
+) -> int:
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    if stock_code:
+        where_clauses.append("stock_codes ILIKE %s")
+        params.append(f"%{stock_code.upper()}%")
+
+    if category:
+        where_clauses.append("news_category = %s")
+        params.append(category)
+
+    if search_query:
+        where_clauses.append("(title ILIKE %s OR subject ILIKE %s OR stock_codes ILIKE %s)")
+        q = f"%{search_query}%"
+        params.extend([q, q, q.upper()])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT COUNT(*) FROM kap_disclosures {where_sql}",
+            params,
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+async def get_disclosure_by_index(index: int) -> DisclosureClassified | None:
+    """Tekil bildirim kaydını döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_disclosure_by_index_sync, conn, index)
+
+
+def _get_disclosure_by_index_sync(
+    conn: psycopg2.extensions.connection, index: int
+) -> DisclosureClassified | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT {_DISCLOSURE_COLUMNS}
+            FROM kap_disclosures
+            WHERE disclosure_index = %s
+            LIMIT 1
+            """,
+            (index,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        return _row_to_disclosure(row)
+    except Exception as exc:
+        log.warning("DB satırı dönüştürülemedi (index={}): {}", index, exc)
+        return None
+
+
+async def get_stats() -> dict:
+    """
+    Dashboard kartları için özet istatistikler döndürür:
+    toplam bildirim, bugün, bu hafta, sentiment dağılımı, en aktif şirketler.
+    """
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_stats_sync, conn)
+
+
+def _get_stats_sync(conn: psycopg2.extensions.connection) -> dict:
+    stats: dict[str, Any] = {}
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM kap_disclosures")
+        row = cur.fetchone()
+        stats["total"] = int(row[0]) if row else 0
+
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM kap_disclosures
+            WHERE publish_datetime_utc >= NOW() - INTERVAL '1 day'
+            """
+        )
+        row = cur.fetchone()
+        stats["today"] = int(row[0]) if row else 0
+
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM kap_disclosures
+            WHERE publish_datetime_utc >= NOW() - INTERVAL '7 days'
+            """
+        )
+        row = cur.fetchone()
+        stats["this_week"] = int(row[0]) if row else 0
+
+        cur.execute(
+            """
+            SELECT sentiment, COUNT(*) as cnt
+            FROM kap_disclosures
+            WHERE sentiment IS NOT NULL
+            GROUP BY sentiment
+            """
+        )
+        rows = cur.fetchall()
+        sentiment_counts: dict[str, int] = {}
+        for r in rows:
+            sentiment_counts[r[0]] = int(r[1])
+        stats["sentiment"] = sentiment_counts
+
+        total_with_sentiment = sum(sentiment_counts.values())
+        if total_with_sentiment > 0:
+            stats["positive_pct"] = round(
+                sentiment_counts.get("Olumlu", 0) / total_with_sentiment * 100, 1
+            )
+            stats["negative_pct"] = round(
+                sentiment_counts.get("Olumsuz", 0) / total_with_sentiment * 100, 1
+            )
+        else:
+            stats["positive_pct"] = 0.0
+            stats["negative_pct"] = 0.0
+
+        cur.execute(
+            """
+            SELECT stock_codes, company_name, COUNT(*) as cnt
+            FROM kap_disclosures
+            WHERE stock_codes IS NOT NULL AND stock_codes != ''
+            GROUP BY stock_codes, company_name
+            ORDER BY cnt DESC
+            LIMIT 5
+            """
+        )
+        rows = cur.fetchall()
+        stats["top_companies"] = [
+            {"stock_codes": r[0], "company_name": r[1] or "", "count": int(r[2])}
+            for r in rows
+        ]
+
+    return stats
 
 
 async def get_last_seen_index() -> int:
@@ -296,14 +491,8 @@ def _get_disclosures_missing_sentiment_sync(
 ) -> list[DisclosureClassified]:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT
-                disclosure_index, disclosure_type, disclosure_class, title,
-                company_id, company_name, stock_codes, publish_date, subject,
-                year_info, kap_link, news_category, company_slug, classified_at,
-                fund_id, fund_code, sub_report_ids, accepted_file_types,
-                sentiment, sentiment_reason, price_at_news, price_5m, price_1h, price_1d, price_1w,
-                full_text
+            f"""
+            SELECT {_DISCLOSURE_COLUMNS}
             FROM kap_disclosures
             WHERE sentiment IS NULL
               AND sentiment_failed_at IS NULL
@@ -317,39 +506,7 @@ def _get_disclosures_missing_sentiment_sync(
     results: list[DisclosureClassified] = []
     for row in rows:
         try:
-            sub_ids = row[16] if isinstance(row[16], list) else []
-            acc_types = row[17] if isinstance(row[17], list) else []
-            classified_at = row[13] if isinstance(row[13], datetime) else datetime.utcnow()
-
-            disc = DisclosureClassified(
-                disclosureIndex=int(row[0]),
-                disclosureType=row[1] or "",
-                disclosureClass=row[2] or "",
-                title=row[3] or "",
-                companyId=row[4] or "",
-                companyName=row[5] or "",
-                stockCodes=row[6] or "",
-                publishDate=row[7] or "",
-                subject=row[8] or "",
-                year=row[9] or "",
-                kapLink=row[10] or "",
-                newsCategory=row[11] or "",
-                companySlug=row[12] or "",
-                classified_at=classified_at,
-                fundId=row[14] or "",
-                fundCode=row[15] or "",
-                subReportIds=sub_ids,
-                acceptedDataFileTypes=acc_types,
-                sentiment=row[18],
-                sentiment_reason=row[19],
-                price_at_news=float(row[20]) if row[20] is not None else None,
-                price_5m=float(row[21]) if row[21] is not None else None,
-                price_1h=float(row[22]) if row[22] is not None else None,
-                price_1d=float(row[23]) if row[23] is not None else None,
-                price_1w=float(row[24]) if row[24] is not None else None,
-                fullText=row[25] or "",
-            )
-            results.append(disc)
+            results.append(_row_to_disclosure(row))
         except Exception as exc:
             log.warning("DB satırı dönüştürülemedi (index={}): {}", row[0], exc)
 
@@ -463,14 +620,8 @@ def _get_disclosures_needing_price_update_sync(
 ) -> list[DisclosureClassified]:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT
-                disclosure_index, disclosure_type, disclosure_class, title,
-                company_id, company_name, stock_codes, publish_date, subject,
-                year_info, kap_link, news_category, company_slug, classified_at,
-                fund_id, fund_code, sub_report_ids, accepted_file_types,
-                sentiment, sentiment_reason, price_at_news, price_5m, price_1h, price_1d, price_1w,
-                full_text
+            f"""
+            SELECT {_DISCLOSURE_COLUMNS}
             FROM kap_disclosures
             WHERE (price_5m IS NULL OR price_1h IS NULL OR price_1d IS NULL OR price_1w IS NULL)
               AND stock_codes IS NOT NULL
@@ -485,39 +636,7 @@ def _get_disclosures_needing_price_update_sync(
     results: list[DisclosureClassified] = []
     for row in rows:
         try:
-            sub_ids = row[16] if isinstance(row[16], list) else []
-            acc_types = row[17] if isinstance(row[17], list) else []
-            classified_at = row[13] if isinstance(row[13], datetime) else datetime.utcnow()
-
-            disc = DisclosureClassified(
-                disclosureIndex=int(row[0]),
-                disclosureType=row[1] or "",
-                disclosureClass=row[2] or "",
-                title=row[3] or "",
-                companyId=row[4] or "",
-                companyName=row[5] or "",
-                stockCodes=row[6] or "",
-                publishDate=row[7] or "",
-                subject=row[8] or "",
-                year=row[9] or "",
-                kapLink=row[10] or "",
-                newsCategory=row[11] or "",
-                companySlug=row[12] or "",
-                classified_at=classified_at,
-                fundId=row[14] or "",
-                fundCode=row[15] or "",
-                subReportIds=sub_ids,
-                acceptedDataFileTypes=acc_types,
-                sentiment=row[18],
-                sentiment_reason=row[19],
-                price_at_news=float(row[20]) if row[20] is not None else None,
-                price_5m=float(row[21]) if row[21] is not None else None,
-                price_1h=float(row[22]) if row[22] is not None else None,
-                price_1d=float(row[23]) if row[23] is not None else None,
-                price_1w=float(row[24]) if row[24] is not None else None,
-                fullText=row[25] or "",
-            )
-            results.append(disc)
+            results.append(_row_to_disclosure(row))
         except Exception as exc:
             log.warning("DB satırı dönüştürülemedi (index={}): {}", row[0], exc)
 
@@ -540,14 +659,8 @@ def _get_disclosures_missing_full_text_sync(
 ) -> list[DisclosureClassified]:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT
-                disclosure_index, disclosure_type, disclosure_class, title,
-                company_id, company_name, stock_codes, publish_date, subject,
-                year_info, kap_link, news_category, company_slug, classified_at,
-                fund_id, fund_code, sub_report_ids, accepted_file_types,
-                sentiment, sentiment_reason, price_at_news, price_5m, price_1h, price_1d, price_1w,
-                full_text
+            f"""
+            SELECT {_DISCLOSURE_COLUMNS}
             FROM kap_disclosures
             WHERE (full_text IS NULL OR full_text = '')
             ORDER BY disclosure_index DESC
@@ -560,39 +673,7 @@ def _get_disclosures_missing_full_text_sync(
     results: list[DisclosureClassified] = []
     for row in rows:
         try:
-            sub_ids = row[16] if isinstance(row[16], list) else []
-            acc_types = row[17] if isinstance(row[17], list) else []
-            classified_at = row[13] if isinstance(row[13], datetime) else datetime.utcnow()
-
-            disc = DisclosureClassified(
-                disclosureIndex=int(row[0]),
-                disclosureType=row[1] or "",
-                disclosureClass=row[2] or "",
-                title=row[3] or "",
-                companyId=row[4] or "",
-                companyName=row[5] or "",
-                stockCodes=row[6] or "",
-                publishDate=row[7] or "",
-                subject=row[8] or "",
-                year=row[9] or "",
-                kapLink=row[10] or "",
-                newsCategory=row[11] or "",
-                companySlug=row[12] or "",
-                classified_at=classified_at,
-                fundId=row[14] or "",
-                fundCode=row[15] or "",
-                subReportIds=sub_ids,
-                acceptedDataFileTypes=acc_types,
-                sentiment=row[18],
-                sentiment_reason=row[19],
-                price_at_news=float(row[20]) if row[20] is not None else None,
-                price_5m=float(row[21]) if row[21] is not None else None,
-                price_1h=float(row[22]) if row[22] is not None else None,
-                price_1d=float(row[23]) if row[23] is not None else None,
-                price_1w=float(row[24]) if row[24] is not None else None,
-                fullText=row[25] or "",
-            )
-            results.append(disc)
+            results.append(_row_to_disclosure(row))
         except Exception as exc:
             log.warning("DB satırı dönüştürülemedi (index={}): {}", row[0], exc)
 
@@ -630,6 +711,141 @@ def _update_full_text_and_reset_sentiment_sync(
 
 
 
+async def update_publish_datetime_utc(
+    disclosure_index: int, publish_datetime_utc: datetime
+) -> None:
+    """publish_datetime_utc sütununu günceller."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, _update_publish_datetime_utc_sync, conn,
+            disclosure_index, publish_datetime_utc,
+        )
+
+
+def _update_publish_datetime_utc_sync(
+    conn: psycopg2.extensions.connection,
+    disclosure_index: int,
+    publish_datetime_utc: datetime,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE kap_disclosures
+               SET publish_datetime_utc = %s
+             WHERE disclosure_index = %s
+            """,
+            (publish_datetime_utc, disclosure_index),
+        )
+
+
+async def get_disclosures_missing_publish_datetime(limit: int = 200) -> list[DisclosureClassified]:
+    """
+    publish_datetime_utc NULL olan bildirimleri döndürür.
+    Backfill için kullanılır: publish_date string'inden parse edilip güncellenir.
+    """
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _get_disclosures_missing_publish_datetime_sync, conn, limit,
+        )
+
+
+def _get_disclosures_missing_publish_datetime_sync(
+    conn: psycopg2.extensions.connection, limit: int,
+) -> list[DisclosureClassified]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT {_DISCLOSURE_COLUMNS}
+            FROM kap_disclosures
+            WHERE publish_datetime_utc IS NULL
+              AND publish_date IS NOT NULL
+              AND publish_date != ''
+            ORDER BY disclosure_index DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    results: list[DisclosureClassified] = []
+    for row in rows:
+        try:
+            results.append(_row_to_disclosure(row))
+        except Exception as exc:
+            log.warning("DB satırı dönüştürülemedi (index={}): {}", row[0], exc)
+    return results
+
+
+async def get_disclosures_needing_price_at_news(limit: int = 100) -> list[DisclosureClassified]:
+    """
+    price_at_news NULL olan ama publish_datetime_utc dolu olan bildirimleri döndürür.
+    Yayınlanma tarihine göre Yahoo Finance'den fiyat çekilecek.
+    """
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _get_disclosures_needing_price_at_news_sync, conn, limit,
+        )
+
+
+def _get_disclosures_needing_price_at_news_sync(
+    conn: psycopg2.extensions.connection, limit: int,
+) -> list[DisclosureClassified]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT {_DISCLOSURE_COLUMNS}
+            FROM kap_disclosures
+            WHERE price_at_news IS NULL
+              AND publish_datetime_utc IS NOT NULL
+              AND stock_codes IS NOT NULL
+              AND stock_codes != ''
+            ORDER BY disclosure_index DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    results: list[DisclosureClassified] = []
+    for row in rows:
+        try:
+            results.append(_row_to_disclosure(row))
+        except Exception as exc:
+            log.warning("DB satırı dönüştürülemedi (index={}): {}", row[0], exc)
+    return results
+
+
+async def update_price_at_news(
+    disclosure_index: int, price_at_news: float
+) -> None:
+    """Sadece price_at_news sütununu günceller."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, _update_price_at_news_sync, conn, disclosure_index, price_at_news,
+        )
+
+
+def _update_price_at_news_sync(
+    conn: psycopg2.extensions.connection,
+    disclosure_index: int,
+    price_at_news: float,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE kap_disclosures
+               SET price_at_news = %s
+             WHERE disclosure_index = %s
+            """,
+            (price_at_news, disclosure_index),
+        )
+
+
+async def update_last_seen_index(index: int) -> None:
     """kap_sync_state tablosunu son görülen indeksle günceller."""
     async with get_connection() as conn:
         loop = asyncio.get_running_loop()
@@ -740,35 +956,59 @@ def _upsert_company_detail_sync(
         )
 
 
-async def get_companies(stock_code: str = "") -> list[dict]:
+async def get_companies(
+    stock_code: str = "",
+    limit: int = 0,
+    offset: int = 0,
+    search_query: str = "",
+) -> list[dict]:
     """
     kap_companies tablosundan şirketleri döndürür.
-    stock_code verilirse exact match filtresi uygulanır.
+    - stock_code: exact match filtresi
+    - search_query: title veya stock_code ILIKE
+    - limit/offset: sayfalama (limit=0 → tümünü getir)
     """
     async with get_connection() as conn:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _get_companies_sync, conn, stock_code)
+        return await loop.run_in_executor(
+            None, _get_companies_sync, conn, stock_code, limit, offset, search_query
+        )
 
 
 def _get_companies_sync(
-    conn: psycopg2.extensions.connection, stock_code: str
+    conn: psycopg2.extensions.connection,
+    stock_code: str,
+    limit: int,
+    offset: int,
+    search_query: str,
 ) -> list[dict]:
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    if stock_code:
+        where_clauses.append("stock_code = %s")
+        params.append(stock_code.upper())
+
+    if search_query:
+        where_clauses.append("(title ILIKE %s OR stock_code ILIKE %s)")
+        q = f"%{search_query}%"
+        params.extend([q, q.upper()])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    query = f"""
+        SELECT member_id, title, stock_code, member_type, kfif_url, company_slug, fetched_at
+        FROM kap_companies
+        {where_sql}
+        ORDER BY title
+    """
+
+    if limit > 0:
+        query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+
     with conn.cursor() as cur:
-        if stock_code:
-            cur.execute(
-                """
-                SELECT member_id, title, stock_code, member_type, kfif_url, company_slug, fetched_at
-                FROM kap_companies WHERE stock_code = %s
-                """,
-                (stock_code.upper(),),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT member_id, title, stock_code, member_type, kfif_url, company_slug, fetched_at
-                FROM kap_companies ORDER BY title
-                """
-            )
+        cur.execute(query, params)
         rows = cur.fetchall()
 
     return [
@@ -783,6 +1023,30 @@ def _get_companies_sync(
         }
         for row in rows
     ]
+
+
+async def count_companies(search_query: str = "") -> int:
+    """Şirket sayısını döndürür (sayfalama için)."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _count_companies_sync, conn, search_query)
+
+
+def _count_companies_sync(
+    conn: psycopg2.extensions.connection, search_query: str
+) -> int:
+    params: list[Any] = []
+    where_sql = ""
+
+    if search_query:
+        where_sql = "WHERE (title ILIKE %s OR stock_code ILIKE %s)"
+        q = f"%{search_query}%"
+        params.extend([q, q.upper()])
+
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM kap_companies {where_sql}", params)
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
 
 
 async def companies_stale(ttl_hours: int = 24) -> bool:

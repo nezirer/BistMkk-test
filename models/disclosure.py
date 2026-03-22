@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import base64
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from bs4 import BeautifulSoup
@@ -126,6 +126,40 @@ class DisclosureRaw(BaseModel):
             "edilip HTML striplenerek elde edilir. Sentiment analizi için kullanılır."
         ),
     )
+    attachment_urls: list[dict] = Field(
+        default_factory=list,
+        alias="attachmentUrls",
+        description="Bildirim ek dosyaları [{url, fileName}]",
+    )
+    related_disclosure_index: str = Field(
+        default="",
+        alias="relatedDisclosureIndex",
+        description="İlişkili bildirimin index'i (varsa)",
+    )
+    period: str = Field(
+        default="",
+        alias="period",
+        description="Bildirimin ait olduğu dönem (period.tr alanından türetilir)",
+    )
+    related_stocks: list[str] = Field(
+        default_factory=list,
+        alias="relatedStocks",
+        description="İlişkili hisse kodları listesi (relatedStocks[].code)",
+    )
+    publish_datetime_utc: datetime | None = Field(
+        default=None,
+        alias="publishDatetimeUtc",
+        description=(
+            "Yayınlanma tarihinin UTC TIMESTAMPTZ karşılığı. "
+            "publish_date string'inden parse edilip Türkiye saatinden (UTC+3) "
+            "UTC'ye çevrilir. Fiyat hesaplamalarında bu alan kullanılır."
+        ),
+    )
+    pdf_link: str = Field(
+        default="",
+        alias="pdfLink",
+        description="İlk ek dosyanın (tercihen PDF) doğrudan bağlantısı",
+    )
 
     model_config = {
         "populate_by_name": True,
@@ -152,12 +186,30 @@ class DisclosureRaw(BaseModel):
         MKK API 'time' alanı ISO-8601 veya DD.MM.YYYY HH:MM formatında
         gelebilir; her ikisini de dener.
         """
-        for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        for fmt in (
+            "%d.%m.%Y %H:%M:%S",
+            "%d.%m.%Y %H:%M",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+        ):
             try:
                 return datetime.strptime(self.publish_date, fmt)
             except ValueError:
                 continue
         return None
+
+    def _parse_publish_datetime_utc(self) -> datetime | None:
+        """
+        publish_date string'ini parse edip UTC'ye çevirir.
+        KAP/MKK zaman damgaları Türkiye saatindedir (UTC+3).
+        """
+        _TURKEY_TZ = timezone(timedelta(hours=3))
+        dt = self.publish_datetime
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_TURKEY_TZ)
+        return dt.astimezone(timezone.utc)
 
     @classmethod
     def from_list_item(cls, item: dict) -> "DisclosureRaw":
@@ -228,6 +280,53 @@ class DisclosureRaw(BaseModel):
                 pass
 
         self.full_text = "\n\n".join(text_parts)[:8000]
+
+        # --- attachmentUrls ---
+        raw_attachments = detail.get("attachmentUrls") or []
+        self.attachment_urls = [
+            {"url": att.get("url", ""), "fileName": att.get("fileName", "")}
+            for att in raw_attachments
+            if isinstance(att, dict) and att.get("url")
+        ]
+
+        # --- relatedDisclosureIndex ---
+        rdi = detail.get("relatedDisclosureIndex")
+        if isinstance(rdi, dict):
+            self.related_disclosure_index = str(rdi.get("relatedDisclosureIndex", "")) or ""
+        else:
+            self.related_disclosure_index = str(rdi) if rdi else ""
+
+        # --- period ---
+        period_obj = detail.get("period")
+        if isinstance(period_obj, dict):
+            self.period = period_obj.get("tr", "") or ""
+        elif isinstance(period_obj, str):
+            self.period = period_obj
+        else:
+            self.period = ""
+
+        # --- relatedStocks ---
+        raw_rs = detail.get("relatedStocks") or []
+        self.related_stocks = [
+            str(s.get("code", "")).strip().upper()
+            for s in raw_rs
+            if isinstance(s, dict) and s.get("code")
+        ]
+
+        # --- publish_datetime_utc ---
+        self.publish_datetime_utc = self._parse_publish_datetime_utc()
+
+        # --- pdf_link ---
+        self.pdf_link = ""
+        if self.attachment_urls:
+            # Önce içinde "pdf" geçen ilk dosyayı bulmaya çalış
+            for att in self.attachment_urls:
+                if "pdf" in att.get("fileName", "").lower() or "pdf" in att.get("url", "").lower():
+                    self.pdf_link = att.get("url", "")
+                    break
+            # Bulamazsa direkt ilk ek dosyanın URL'sini al
+            if not self.pdf_link:
+                self.pdf_link = self.attachment_urls[0].get("url", "")
 
 
 class DisclosureClassified(DisclosureRaw):

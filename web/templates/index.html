@@ -1,20 +1,84 @@
 {% extends "base.html" %}
 
+{% macro sentiment_badge(sentiment, reason) %}
+  {% if sentiment == 'Olumlu' %}
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800" title="{{ reason }}">
+      ▲ Olumlu
+    </span>
+  {% elif sentiment == 'Olumsuz' %}
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-800" title="{{ reason }}">
+      ▼ Olumsuz
+    </span>
+  {% elif sentiment == 'Nötr' %}
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700" title="{{ reason }}">
+      — Nötr
+    </span>
+  {% else %}
+    <span class="text-xs text-slate-400">—</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro category_badge(cat) %}
+  {% if 'Finansal' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">{{ cat }}</span>
+  {% elif 'Özel' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-800">{{ cat }}</span>
+  {% elif 'Genel' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-sky-100 text-sky-800">{{ cat }}</span>
+  {% elif 'Sermaye' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">{{ cat }}</span>
+  {% elif 'Yönetim' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-100 text-orange-800">{{ cat }}</span>
+  {% elif 'Temettü' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800">{{ cat }}</span>
+  {% else %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700">{{ cat }}</span>
+  {% endif %}
+{% endmacro %}
+
 {% block title %}Ana Sayfa{% endblock %}
 
 {% block content %}
-<div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+
+<!-- İstatistik kartları -->
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+  <div class="bg-white rounded-xl border border-slate-200 shadow-sm px-4 py-4">
+    <p class="text-xs font-medium text-slate-500 mb-1">Toplam Bildirim</p>
+    <p class="text-2xl font-bold text-slate-800">{{ stats.total | default(0) }}</p>
+  </div>
+  <div class="bg-white rounded-xl border border-slate-200 shadow-sm px-4 py-4">
+    <p class="text-xs font-medium text-slate-500 mb-1">Son 24 Saat</p>
+    <p class="text-2xl font-bold text-brand-600">{{ stats.today | default(0) }}</p>
+  </div>
+  <div class="bg-white rounded-xl border border-slate-200 shadow-sm px-4 py-4">
+    <p class="text-xs font-medium text-slate-500 mb-1">Olumlu Oran</p>
+    <p class="text-2xl font-bold text-emerald-600">%{{ stats.positive_pct | default(0) }}</p>
+  </div>
+  <div class="bg-white rounded-xl border border-slate-200 shadow-sm px-4 py-4">
+    <p class="text-xs font-medium text-slate-500 mb-1">Olumsuz Oran</p>
+    <p class="text-2xl font-bold text-red-600">%{{ stats.negative_pct | default(0) }}</p>
+  </div>
+</div>
+
+<!-- Başlık + filtreler -->
+<div class="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
   <div>
-    <h1 class="text-2xl font-bold text-gray-900">Son Bildirimler</h1>
-    <p class="text-sm text-gray-500 mt-1">
-      Toplam <span class="font-semibold text-indigo-600">{{ total }}</span> bildirim önbellekte &mdash; son 50 gösteriliyor.
+    <h1 class="text-xl font-bold text-slate-800">
+      {% if search_query %}
+        "<span class="text-brand-600">{{ search_query }}</span>" için sonuçlar
+      {% else %}
+        Son Bildirimler
+      {% endif %}
+    </h1>
+    <p class="text-sm text-slate-500 mt-0.5">
+      Toplam <span class="font-semibold text-brand-600">{{ total }}</span> bildirim
+      {% if search_query %}<a href="/" class="ml-2 text-xs text-slate-400 hover:text-brand-500 underline">Temizle</a>{% endif %}
     </p>
   </div>
-  <!-- Kategori filtreleri -->
   <div class="flex flex-wrap gap-2">
     {% for key, label in category_labels.items() %}
     <a href="/category/{{ key }}"
-       class="inline-block px-3 py-1 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors">
+       class="inline-block px-3 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700 hover:bg-brand-100 hover:text-brand-700 transition-colors">
       {{ label }}
     </a>
     {% endfor %}
@@ -22,80 +86,70 @@
 </div>
 
 {% if disclosures %}
-<div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+<div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
   <div class="overflow-x-auto">
-    <table class="min-w-full divide-y divide-gray-200 text-sm">
-      <thead class="bg-gray-50">
-        <tr>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Tarih</th>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Şirket</th>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Kategori</th>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600">Başlık</th>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Duygu</th>
-          <th class="px-4 py-3 text-left font-semibold text-gray-600 whitespace-nowrap">Fiyat Etkisi</th>
-          <th class="px-4 py-3 text-center font-semibold text-gray-600 whitespace-nowrap">KAP</th>
+    <table class="min-w-full divide-y divide-slate-100 text-sm">
+      <thead>
+        <tr class="bg-slate-50">
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Tarih</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Şirket</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Kategori</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">Başlık</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Duygu</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Fiyat Etkisi</th>
+          <th class="px-4 py-3 text-center text-xs font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">KAP</th>
         </tr>
       </thead>
-      <tbody class="divide-y divide-gray-100">
+      <tbody class="divide-y divide-slate-100">
         {% for d in disclosures %}
-        <tr class="hover:bg-gray-50 transition-colors">
-          <td class="px-4 py-3 text-gray-500 whitespace-nowrap text-xs">{{ d.publish_date }}</td>
+        <tr class="hover:bg-slate-50 transition-colors clickable-row cursor-pointer"
+            data-href="/disclosure/{{ d.disclosure_index }}">
+          <td class="px-4 py-3 text-slate-500 whitespace-nowrap text-xs">
+            {{ d.publish_date[:10] if d.publish_date and d.publish_date|length > 10 else d.publish_date or '—' }}
+          </td>
           <td class="px-4 py-3 whitespace-nowrap">
             <a href="/company/{{ d.stock_codes }}"
-               class="font-semibold text-indigo-600 hover:text-indigo-800 hover:underline">
+               class="font-semibold text-brand-600 hover:text-brand-800 hover:underline"
+               onclick="event.stopPropagation()">
               {{ d.stock_codes }}
             </a>
-            <div class="text-xs text-gray-400 truncate max-w-[140px]">{{ d.company_name }}</div>
+            <div class="text-xs text-slate-400 truncate max-w-[130px]">{{ d.company_name }}</div>
           </td>
           <td class="px-4 py-3 whitespace-nowrap">
             <a href="/category/{{ d.news_category | lower | replace(' ', '_') }}"
-               class="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700">
-              {{ d.news_category }}
+               onclick="event.stopPropagation()">
+              {{ category_badge(d.news_category or 'Diğer') }}
             </a>
           </td>
-          <td class="px-4 py-3 text-gray-700 max-w-xs">
+          <td class="px-4 py-3 text-slate-700 max-w-xs">
             <span class="line-clamp-2" title="{{ d.title or d.subject }}">{{ d.title or d.subject or '—' }}</span>
           </td>
           <td class="px-4 py-3 whitespace-nowrap">
-            {% if d.sentiment == 'Olumlu' %}
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800" title="{{ d.sentiment_reason }}">
-                Olumlu
-              </span>
-            {% elif d.sentiment == 'Olumsuz' %}
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800" title="{{ d.sentiment_reason }}">
-                Olumsuz
-              </span>
-            {% elif d.sentiment == 'Nötr' %}
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800" title="{{ d.sentiment_reason }}">
-                Nötr
-              </span>
-            {% else %}
-              <span class="text-xs text-gray-400">—</span>
-            {% endif %}
+            {{ sentiment_badge(d.sentiment, d.sentiment_reason) }}
           </td>
-          <td class="px-4 py-3 whitespace-nowrap text-xs">
+          <td class="px-4 py-3 whitespace-nowrap text-xs font-mono">
             {% if d.price_at_news %}
-              <div class="text-gray-600">Anlık: {{ "%.2f"|format(d.price_at_news) }} ₺</div>
+              <div class="text-slate-500">{{ "%.2f"|format(d.price_at_news) }} ₺</div>
               {% if d.price_5m %}
                 {% set diff = ((d.price_5m - d.price_at_news) / d.price_at_news) * 100 %}
-                <div class="{% if diff > 0 %}text-green-600{% elif diff < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
-                  5dk: {{ "%.2f"|format(d.price_5m) }} ({{ "%+.2f"|format(diff) }}%)
+                <div class="{% if diff > 0 %}text-emerald-600{% elif diff < 0 %}text-red-600{% else %}text-slate-500{% endif %}">
+                  5dk {{ "%+.2f"|format(diff) }}%
                 </div>
               {% endif %}
               {% if d.price_1h %}
                 {% set diff = ((d.price_1h - d.price_at_news) / d.price_at_news) * 100 %}
-                <div class="{% if diff > 0 %}text-green-600{% elif diff < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
-                  1sa: {{ "%.2f"|format(d.price_1h) }} ({{ "%+.2f"|format(diff) }}%)
+                <div class="{% if diff > 0 %}text-emerald-600{% elif diff < 0 %}text-red-600{% else %}text-slate-500{% endif %}">
+                  1sa {{ "%+.2f"|format(diff) }}%
                 </div>
               {% endif %}
             {% else %}
-              <span class="text-gray-400">—</span>
+              <span class="text-slate-400">—</span>
             {% endif %}
           </td>
-          <td class="px-4 py-3 text-center">
+          <td class="px-4 py-3 text-center" onclick="event.stopPropagation()">
             <a href="https://www.kap.org.tr/tr/Bildirim/{{ d.disclosure_index }}"
                target="_blank"
-               class="inline-flex items-center gap-1 text-xs text-indigo-500 hover:text-indigo-700 font-medium"
+               class="inline-flex items-center gap-1 text-xs text-brand-500 hover:text-brand-700 font-medium"
                title="KAP'ta aç">
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -110,20 +164,60 @@
     </table>
   </div>
 </div>
+
+<!-- Sayfalama -->
+{% if total_pages > 1 %}
+<div class="mt-6 flex items-center justify-between">
+  <p class="text-sm text-slate-500">
+    Sayfa <strong>{{ page }}</strong> / <strong>{{ total_pages }}</strong>
+    &mdash; toplam <strong>{{ total }}</strong> sonuç
+  </p>
+  <div class="flex items-center gap-2">
+    {% if page > 1 %}
+    <a href="?page={{ page - 1 }}{% if search_query %}&q={{ search_query }}{% endif %}"
+       class="px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors">
+      ← Önceki
+    </a>
+    {% endif %}
+
+    {% for p in range([1, page - 2]|max, [total_pages + 1, page + 3]|min) %}
+    <a href="?page={{ p }}{% if search_query %}&q={{ search_query }}{% endif %}"
+       class="px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors
+              {% if p == page %}border-brand-500 bg-brand-600 text-white{% else %}border-slate-200 bg-white text-slate-700 hover:bg-slate-50{% endif %}">
+      {{ p }}
+    </a>
+    {% endfor %}
+
+    {% if page < total_pages %}
+    <a href="?page={{ page + 1 }}{% if search_query %}&q={{ search_query }}{% endif %}"
+       class="px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors">
+      Sonraki →
+    </a>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
 {% else %}
-<div class="text-center py-20 text-gray-400">
-  <p class="text-lg font-medium">Henüz bildirim yok</p>
-  {% if provider_name == "mock" %}
-  <p class="text-sm mt-1">
-    MockProvider aktif — <code class="bg-gray-100 text-gray-600 px-1 rounded">fetcher/mock_data.json</code>
-    dosyası yoksa veri gelmez.
+<div class="bg-white rounded-xl border border-slate-200 text-center py-20 text-slate-400">
+  <svg class="w-12 h-12 mx-auto mb-4 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+  </svg>
+  <p class="text-lg font-medium">
+    {% if search_query %}
+      "{{ search_query }}" için sonuç bulunamadı
+    {% else %}
+      Henüz bildirim yok
+    {% endif %}
   </p>
-  <p class="text-xs mt-2">
-    Gerçek veri için MKK API key alın ve <code class="bg-gray-100 text-gray-600 px-1 rounded">KAP_PROVIDER=mkk</code> yapılandırın.
-  </p>
+  {% if search_query %}
+  <a href="/" class="mt-3 inline-block text-sm text-brand-500 hover:underline">Tüm bildirimlere dön</a>
+  {% elif provider_name == "mock" %}
+  <p class="text-sm mt-2">MockProvider aktif — gerçek veri için <code class="bg-slate-100 text-slate-600 px-1 rounded">KAP_PROVIDER=mkk</code> yapılandırın.</p>
   {% else %}
   <p class="text-sm mt-1">MKKProvider üzerinden veri bekleniyor…</p>
   {% endif %}
 </div>
 {% endif %}
+
 {% endblock %}

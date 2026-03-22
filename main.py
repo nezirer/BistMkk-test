@@ -21,7 +21,7 @@ from db.connection import init_pool, close_pool, get_connection
 from db.models import create_tables
 from fetcher.base_provider import BaseKAPProvider
 from fetcher.provider_factory import get_provider
-from fetcher.finance import get_current_price, get_price_at_time
+from fetcher.finance import get_current_price, get_price_at_time, get_price_at_publish
 from models.disclosure import DisclosureClassified, DisclosureRaw
 from utils.logger import get_logger
 
@@ -30,6 +30,8 @@ templates = Jinja2Templates(directory="web/templates")
 
 _scheduler = AsyncIOScheduler()
 _provider: BaseKAPProvider | None = None
+
+PAGE_SIZE = 50
 
 
 def _provider_name() -> str:
@@ -98,12 +100,15 @@ async def _fetch_and_classify() -> None:
                 classified.sentiment = sentiment_result.sentiment
                 classified.sentiment_reason = sentiment_result.reason
                 
-            # Haber anı fiyatı
-            if classified.stock_codes:
-                # İlk hisse kodunu alalım (örn: "THYAO,THYAO2" -> "THYAO")
+            # publish_datetime_utc'yi hesapla (model'de parse edilmişse kullan)
+            if not classified.publish_datetime_utc:
+                classified.publish_datetime_utc = classified._parse_publish_datetime_utc()
+
+            # Haber anı fiyatı — yayınlanma tarihine göre Yahoo Finance'den
+            if classified.stock_codes and classified.publish_datetime_utc:
                 first_code = classified.stock_codes.split(",")[0].strip()
                 if first_code:
-                    price = await get_current_price(first_code)
+                    price = await get_price_at_publish(first_code, classified.publish_datetime_utc)
                     if price is not None:
                         classified.price_at_news = price
 
@@ -238,9 +243,10 @@ async def _backfill_full_text() -> None:
         log.error("Full-text backfill genel hata: {}", exc)
 
 
-
+async def _update_prices() -> None:
     """
     Eski bildirimlerin fiyatlarını (5dk, 1sa, 1g, 1h) günceller.
+    publish_datetime_utc üzerinden hesaplama yapılır.
     """
     try:
         disclosures = await repo.get_disclosures_needing_price_update()
@@ -252,10 +258,10 @@ async def _backfill_full_text() -> None:
         updated_count = 0
 
         for disc in disclosures:
-            if not disc.stock_codes or not disc.publish_datetime:
+            pub_time = disc.publish_datetime_utc
+            if not disc.stock_codes or not pub_time:
                 continue
 
-            pub_time = disc.publish_datetime
             if pub_time.tzinfo is None:
                 pub_time = pub_time.replace(tzinfo=timezone.utc)
 
@@ -269,19 +275,15 @@ async def _backfill_full_text() -> None:
             new_1d: float | None = None
             new_1w: float | None = None
 
-            # 5 dakika
             if disc.price_5m is None and time_diff >= timedelta(minutes=5):
                 new_5m = await get_price_at_time(first_code, pub_time + timedelta(minutes=5))
 
-            # 1 saat
             if disc.price_1h is None and time_diff >= timedelta(hours=1):
                 new_1h = await get_price_at_time(first_code, pub_time + timedelta(hours=1))
 
-            # 1 gün
             if disc.price_1d is None and time_diff >= timedelta(days=1):
                 new_1d = await get_price_at_time(first_code, pub_time + timedelta(days=1))
 
-            # 1 hafta
             if disc.price_1w is None and time_diff >= timedelta(days=7):
                 new_1w = await get_price_at_time(first_code, pub_time + timedelta(days=7))
 
@@ -296,6 +298,48 @@ async def _backfill_full_text() -> None:
 
     except Exception as exc:
         log.error("Fiyat güncelleme hatası: {}", exc)
+
+
+async def _backfill_publish_datetime() -> None:
+    """
+    DB'de publish_datetime_utc NULL olan kayıtların publish_date string'inden
+    datetime parse edip günceller. Ayrıca price_at_news NULL olanları
+    yayınlanma tarihine göre Yahoo Finance'den çeker.
+    """
+    try:
+        # 1) publish_datetime_utc eksik olanları doldur
+        pending_dt = await repo.get_disclosures_missing_publish_datetime(limit=200)
+        if pending_dt:
+            log.info("publish_datetime_utc backfill: {} kayıt işlenecek.", len(pending_dt))
+            dt_updated = 0
+            for disc in pending_dt:
+                utc_dt = disc._parse_publish_datetime_utc()
+                if utc_dt:
+                    await repo.update_publish_datetime_utc(disc.disclosure_index, utc_dt)
+                    dt_updated += 1
+            if dt_updated > 0:
+                log.info("publish_datetime_utc backfill: {} kayıt güncellendi.", dt_updated)
+
+        # 2) price_at_news eksik olanları yayınlanma tarihine göre çek
+        pending_price = await repo.get_disclosures_needing_price_at_news(limit=50)
+        if pending_price:
+            log.info("price_at_news backfill: {} kayıt işlenecek.", len(pending_price))
+            price_updated = 0
+            for disc in pending_price:
+                if not disc.publish_datetime_utc or not disc.stock_codes:
+                    continue
+                first_code = disc.stock_codes.split(",")[0].strip()
+                if not first_code:
+                    continue
+                price = await get_price_at_publish(first_code, disc.publish_datetime_utc)
+                if price is not None:
+                    await repo.update_price_at_news(disc.disclosure_index, price)
+                    price_updated += 1
+            if price_updated > 0:
+                log.info("price_at_news backfill: {} kayıt güncellendi.", price_updated)
+
+    except Exception as exc:
+        log.error("publish_datetime/price_at_news backfill hatası: {}", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -326,15 +370,19 @@ async def lifespan(app: FastAPI):
     # DB'deki full_text eksik kayıtları tamamla (başlangıçta bir kez)
     await _backfill_full_text()
 
+    # Mevcut kayıtların publish_datetime_utc + price_at_news backfill (başlangıçta bir kez)
+    await _backfill_publish_datetime()
+
     _scheduler.add_job(_fetch_and_classify, "interval", minutes=3, id="kap_poll")
     _scheduler.add_job(_update_prices, "interval", minutes=5, id="price_update")
     _scheduler.add_job(_backfill_sentiment, "interval", minutes=10, id="sentiment_backfill")
     _scheduler.add_job(_backfill_full_text, "interval", minutes=15, id="full_text_backfill")
+    _scheduler.add_job(_backfill_publish_datetime, "interval", minutes=10, id="publish_datetime_backfill")
     _scheduler.start()
     log.info(
         "APScheduler başlatıldı — her 3 dakikada bir polling, "
         "her 5 dakikada bir fiyat güncellemesi, "
-        "her 10 dakikada bir sentiment backfill, "
+        "her 10 dakikada bir sentiment + publish_datetime backfill, "
         "her 15 dakikada bir full-text backfill."
     )
 
@@ -379,33 +427,50 @@ def _base_ctx() -> dict:
 # ---------------------------------------------------------------------------
 
 @app.get("/")
-async def index(request: Request):
-    """Ana sayfa — son 50 bildirimi listeler (DB'den)."""
-    disclosures = await repo.get_disclosures(limit=50)
-    companies = await repo.get_companies()
+async def index(request: Request, page: int = 1, q: str = ""):
+    """Ana sayfa — bildirimleri sayfalı olarak listeler, arama destekler."""
+    page = max(1, page)
+    offset = (page - 1) * PAGE_SIZE
+    search_query = q.strip()
+
+    disclosures = await repo.get_disclosures(
+        limit=PAGE_SIZE, offset=offset, search_query=search_query
+    )
+    total = await repo.count_disclosures(search_query=search_query)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    stats = await repo.get_stats()
+
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "title": "KAP Classifier",
             "disclosures": disclosures,
-            "companies": companies,
-            "categories": news_svc.ALL_CATEGORIES,
-            "total": len(disclosures),
+            "total": total,
+            "stats": stats,
+            "page": page,
+            "total_pages": total_pages,
+            "search_query": search_query,
             **_base_ctx(),
         },
     )
 
 
 @app.get("/company/{stock_code}")
-async def company_detail(request: Request, stock_code: str):
-    """Şirkete ait tüm bildirimleri listeler (DB'den)."""
+async def company_detail(request: Request, stock_code: str, page: int = 1):
+    """Şirkete ait tüm bildirimleri sayfalı olarak listeler."""
     code = stock_code.strip().upper()
-    disclosures = await repo.get_disclosures(limit=500, stock_code=code)
+    page = max(1, page)
+    offset = (page - 1) * PAGE_SIZE
+
+    disclosures = await repo.get_disclosures(limit=PAGE_SIZE, stock_code=code, offset=offset)
+    total = await repo.count_disclosures(stock_code=code)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
     companies = await repo.get_companies(stock_code=code)
     company = companies[0] if companies else None
 
-    if not company and not disclosures:
+    if not company and not disclosures and page == 1:
         raise HTTPException(status_code=404, detail=f"'{code}' hisse kodu bulunamadı.")
 
     company_name = company["title"] if company else code
@@ -417,16 +482,25 @@ async def company_detail(request: Request, stock_code: str):
             "stock_code": code,
             "company_name": company_name,
             "disclosures": disclosures,
+            "total": total,
+            "page": page,
+            "total_pages": total_pages,
             **_base_ctx(),
         },
     )
 
 
 @app.get("/category/{category}")
-async def category_detail(request: Request, category: str):
-    """Kategoriye ait tüm bildirimleri listeler (DB'den)."""
+async def category_detail(request: Request, category: str, page: int = 1):
+    """Kategoriye ait tüm bildirimleri sayfalı olarak listeler."""
     label = news_svc.get_category_label(category)
-    disclosures = await repo.get_disclosures(limit=500, category=label)
+    page = max(1, page)
+    offset = (page - 1) * PAGE_SIZE
+
+    disclosures = await repo.get_disclosures(limit=PAGE_SIZE, category=label, offset=offset)
+    total = await repo.count_disclosures(category=label)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
     return templates.TemplateResponse(
         "category.html",
         {
@@ -435,6 +509,9 @@ async def category_detail(request: Request, category: str):
             "category_key": category,
             "category_label": label,
             "disclosures": disclosures,
+            "total": total,
+            "page": page,
+            "total_pages": total_pages,
             **_base_ctx(),
         },
     )
@@ -446,24 +523,92 @@ async def api_disclosures(
     stock_code: str = "",
     category: str = "",
     offset: int = 0,
+    q: str = "",
 ) -> JSONResponse:
-    """JSON API — bildirim listesi (isteğe bağlı filtreler: stock_code, category, limit, offset)."""
+    """JSON API — bildirim listesi (isteğe bağlı filtreler: stock_code, category, limit, offset, q)."""
     category_label = ""
     if category:
         category_label = news_svc.get_category_label(category)
 
+    search_query = q.strip()
     items = await repo.get_disclosures(
         limit=limit,
         stock_code=stock_code.strip().upper() if stock_code else "",
         category=category_label,
         offset=offset,
+        search_query=search_query,
+    )
+    total = await repo.count_disclosures(
+        stock_code=stock_code.strip().upper() if stock_code else "",
+        category=category_label,
+        search_query=search_query,
     )
     return JSONResponse(
         content={
-            "total": len(items),
+            "total": total,
             "offset": offset,
             "disclosures": [d.model_dump(by_alias=True, mode="json") for d in items],
         }
+    )
+
+
+@app.get("/api/stats")
+async def api_stats() -> JSONResponse:
+    """JSON API — sistem istatistikleri."""
+    stats = await repo.get_stats()
+    return JSONResponse(content=stats)
+
+
+@app.get("/companies")
+async def companies_list(request: Request, page: int = 1, q: str = ""):
+    """Tüm şirketleri sayfalı olarak listeler, arama destekler."""
+    page = max(1, page)
+    offset = (page - 1) * PAGE_SIZE
+    search_query = q.strip()
+
+    companies = await repo.get_companies(
+        limit=PAGE_SIZE, offset=offset, search_query=search_query
+    )
+    total = await repo.count_companies(search_query=search_query)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    return templates.TemplateResponse(
+        "companies.html",
+        {
+            "request": request,
+            "title": "Şirketler",
+            "companies": companies,
+            "total": total,
+            "page": page,
+            "total_pages": total_pages,
+            "search_query": search_query,
+            **_base_ctx(),
+        },
+    )
+
+
+@app.get("/disclosure/{index}")
+async def disclosure_detail(request: Request, index: int):
+    """Tekil bildirim detay sayfası — full_text + fiyat hareketleri."""
+    disclosure = await repo.get_disclosure_by_index(index)
+    if disclosure is None:
+        raise HTTPException(status_code=404, detail=f"Bildirim #{index} bulunamadı.")
+
+    related: list = []
+    if disclosure.stock_codes:
+        code = disclosure.stock_codes.split(",")[0].strip()
+        all_related = await repo.get_disclosures(limit=6, stock_code=code)
+        related = [d for d in all_related if d.disclosure_index != index][:5]
+
+    return templates.TemplateResponse(
+        "disclosure.html",
+        {
+            "request": request,
+            "title": disclosure.title or disclosure.subject or f"Bildirim #{index}",
+            "disclosure": disclosure,
+            "related": related,
+            **_base_ctx(),
+        },
     )
 
 

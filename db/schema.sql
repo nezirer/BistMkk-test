@@ -39,7 +39,12 @@ CREATE TABLE IF NOT EXISTS kap_disclosures (
     price_5m            NUMERIC(10, 4),
     price_1h            NUMERIC(10, 4),
     price_1d            NUMERIC(10, 4),
-    price_1w            NUMERIC(10, 4)
+    price_1w            NUMERIC(10, 4),
+    attachment_urls      JSONB           DEFAULT '[]',
+    related_disclosure_index VARCHAR(50),
+    period              VARCHAR(200),
+    related_stocks      JSONB           DEFAULT '[]',
+    pdf_link            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_disc_stock    ON kap_disclosures (stock_codes);
@@ -91,3 +96,16 @@ ON CONFLICT (state_key) DO NOTHING;
 -- Migration: mevcut DB'lerde sentiment_failed_at sütunu yoksa ekle
 ALTER TABLE kap_disclosures
     ADD COLUMN IF NOT EXISTS sentiment_failed_at TIMESTAMPTZ;
+
+-- Migration: v3.3 — API'den gelen ek bilgi alanları
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS attachment_urls JSONB DEFAULT '[]';
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS related_disclosure_index VARCHAR(50);
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS period VARCHAR(200);
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS related_stocks JSONB DEFAULT '[]';
+
+-- Migration: v3.4 — publish_datetime_utc: yayınlanma tarihini TIMESTAMPTZ olarak tutma
+-- Fiyat hesaplamaları publish_date string'i yerine bu sütuna dayalı yapılır
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS publish_datetime_utc TIMESTAMPTZ;
+
+-- Migration: v3.5 — pdf_link: İlk ek dosyanın (tercihen PDF) doğrudan bağlantısı
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS pdf_link TEXT;
