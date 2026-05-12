@@ -1,22 +1,13 @@
 """Şirket bazlı sınıflandırma ve normalize etme."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Dict
 
 from utils.logger import get_logger
+from utils.text import slugify
 
 log = get_logger(__name__)
-
-
-def _slugify(text: str) -> str:
-    """Türkçe karakterler dahil metni URL-dostu slug'a dönüştürür."""
-    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosucgiosu")
-    text = text.translate(tr_map).lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return text.strip("-")
-
 
 @dataclass
 class CompanyInfo:
@@ -29,7 +20,7 @@ class CompanyInfo:
     def __post_init__(self) -> None:
         self.stock_code = self.stock_code.strip().upper()
         if not self.slug:
-            self.slug = _slugify(self.company_name)
+            self.slug = slugify(self.company_name)
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +45,7 @@ def get_company_slug(stock_code: str, company_name: str) -> str:
     normalized = stock_code.strip().upper()
 
     if not normalized:
-        return _slugify(company_name) if company_name else ""
+        return slugify(company_name) if company_name else ""
 
     if normalized in _company_registry:
         return _company_registry[normalized].slug

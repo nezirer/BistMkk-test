@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS kap_disclosures (
     fund_code           VARCHAR(50),
     sub_report_ids      JSONB           DEFAULT '[]',
     accepted_file_types JSONB           DEFAULT '[]',
+    full_text           TEXT,
     sentiment              VARCHAR(20),
     sentiment_reason       VARCHAR(1000),
     sentiment_failed_at    TIMESTAMPTZ,
@@ -44,6 +45,10 @@ CREATE TABLE IF NOT EXISTS kap_disclosures (
     related_disclosure_index VARCHAR(50),
     period              VARCHAR(200),
     related_stocks      JSONB           DEFAULT '[]',
+    publish_datetime_utc TIMESTAMPTZ,
+    llm_summary         TEXT,
+    llm_summary_at      TIMESTAMPTZ,
+    llm_summary_source  VARCHAR(20),
     pdf_link            TEXT
 );
 
@@ -89,11 +94,49 @@ CREATE TABLE IF NOT EXISTS kap_sync_state (
     updated_at   TIMESTAMPTZ   DEFAULT NOW()
 );
 
+-- ---------------------------------------------------------------------------
+-- kap_pdf_texts
+-- PDF dosyalarından çıkarılan ham metin
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS kap_pdf_texts (
+    disclosure_index BIGINT PRIMARY KEY,
+    extracted_text   TEXT,
+    parsed_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ---------------------------------------------------------------------------
+-- kap_pdf_parsed_data
+-- Lokal Gemma ile PDF/full_text üzerinden çıkarılan yapılandırılmış veri
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS kap_pdf_parsed_data (
+    disclosure_index BIGINT PRIMARY KEY,
+    category_type    VARCHAR(100),
+    parsed_json      JSONB,
+    summary          TEXT,
+    summarized_at    TIMESTAMPTZ DEFAULT NOW(),
+    extracted_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ---------------------------------------------------------------------------
+-- kap_disclosure_analiz
+-- Lokal Gemma yatırımcı değerlendirmesi çıktıları
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS kap_disclosure_analiz (
+    disclosure_index BIGINT PRIMARY KEY,
+    analyzed_text    TEXT,
+    sentiment_label  VARCHAR(20),
+    confidence_score NUMERIC(6, 4),
+    analyzed_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
 INSERT INTO kap_sync_state (state_key, state_value)
 VALUES ('last_disclosure_index', '0')
 ON CONFLICT (state_key) DO NOTHING;
 
 -- Migration: mevcut DB'lerde sentiment_failed_at sütunu yoksa ekle
+ALTER TABLE kap_disclosures
+    ADD COLUMN IF NOT EXISTS full_text TEXT;
+
 ALTER TABLE kap_disclosures
     ADD COLUMN IF NOT EXISTS sentiment_failed_at TIMESTAMPTZ;
 
@@ -109,3 +152,10 @@ ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS publish_datetime_utc TIMEST
 
 -- Migration: v3.5 — pdf_link: İlk ek dosyanın (tercihen PDF) doğrudan bağlantısı
 ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS pdf_link TEXT;
+
+-- Migration: v4.2 — lokal Gemma özet alanları
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS llm_summary TEXT;
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS llm_summary_at TIMESTAMPTZ;
+ALTER TABLE kap_disclosures ADD COLUMN IF NOT EXISTS llm_summary_source VARCHAR(20);
+ALTER TABLE kap_pdf_parsed_data ADD COLUMN IF NOT EXISTS summary TEXT;
+ALTER TABLE kap_pdf_parsed_data ADD COLUMN IF NOT EXISTS summarized_at TIMESTAMPTZ DEFAULT NOW();

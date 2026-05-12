@@ -1,0 +1,35 @@
+{% macro sentiment_badge(sentiment, reason) %}
+  {% if sentiment == 'Olumlu' %}
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800" title="{{ reason }}">
+      ▲ Olumlu
+    </span>
+  {% elif sentiment == 'Olumsuz' %}
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-800" title="{{ reason }}">
+      ▼ Olumsuz
+    </span>
+  {% elif sentiment == 'Nötr' %}
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700" title="{{ reason }}">
+      — Nötr
+    </span>
+  {% else %}
+    <span class="text-xs text-slate-400">—</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro category_badge(cat) %}
+  {% if 'Finansal' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">{{ cat }}</span>
+  {% elif 'Özel' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-800">{{ cat }}</span>
+  {% elif 'Genel' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-sky-100 text-sky-800">{{ cat }}</span>
+  {% elif 'Sermaye' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">{{ cat }}</span>
+  {% elif 'Yönetim' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-100 text-orange-800">{{ cat }}</span>
+  {% elif 'Temettü' in cat %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800">{{ cat }}</span>
+  {% else %}
+    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700">{{ cat }}</span>
+  {% endif %}
+{% endmacro %}

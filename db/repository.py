@@ -8,28 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from datetime import datetime
 from typing import Any
 
 import psycopg2.extensions
+import psycopg2.extras
 
 from db.connection import get_connection
 from models.disclosure import DisclosureClassified
 from utils.logger import get_logger
+from utils.text import slugify
 
 log = get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Yardımcılar
-# ---------------------------------------------------------------------------
-
-def _slugify(text: str) -> str:
-    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosucgiosu")
-    text = text.translate(tr_map).lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return text.strip("-")
 
 
 _DISCLOSURE_COLUMNS = """
@@ -83,7 +73,7 @@ def _row_to_disclosure(row: tuple) -> DisclosureClassified:
         period=row[28] or "",
         relatedStocks=rel_stocks,
         publishDatetimeUtc=row[30] if len(row) > 30 else None,
-        pdfLink=row[31] if len(row) > 31 else "",
+        pdfLink=(row[31] or "") if len(row) > 31 else "",
     )
 
 
@@ -477,7 +467,7 @@ async def get_disclosures_missing_sentiment(limit: int = 50) -> list[DisclosureC
     """
     DB'de sentiment analizi yapılmamış (sentiment IS NULL) ve daha önce
     başarısız olmamış (sentiment_failed_at IS NULL) bildirimleri döndürür.
-    Bu sayede OpenAI API hatası alan kayıtlar sonsuz döngüye girmez.
+    Bu sayede sentiment analizi hatası alan kayıtlar sonsuz döngüye girmez.
     """
     async with get_connection() as conn:
         loop = asyncio.get_running_loop()
@@ -893,7 +883,7 @@ def _upsert_company_sync(
     stock_code = str(member.get("stockCode", "") or "")
     member_type = str(member.get("memberType", "") or "")
     kfif_url = str(member.get("kfifUrl", "") or "")
-    slug = _slugify(title) if title else ""
+    slug = slugify(title) if title else ""
 
     with conn.cursor() as cur:
         cur.execute(
@@ -1080,3 +1070,631 @@ def _companies_stale_sync(
     last_fetch: datetime = row[0].replace(tzinfo=None) if row[0].tzinfo else row[0]
     age_hours = (datetime.utcnow() - last_fetch).total_seconds() / 3600
     return age_hours >= ttl_hours
+
+
+# ---------------------------------------------------------------------------
+# PDF Metin İşlemleri
+# ---------------------------------------------------------------------------
+
+async def get_disclosures_with_unparsed_pdfs(limit: int = 10) -> list[DisclosureClassified]:
+    """
+    pdf_link dolu olan (veya attachment_urls'de pdf geçen) ama kap_pdf_texts
+    tablosunda henüz ayrıştırılmış metni bulunmayan bildirimleri döndürür.
+    """
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _get_disclosures_with_unparsed_pdfs_sync, conn, limit
+        )
+
+
+def _get_disclosures_with_unparsed_pdfs_sync(
+    conn: psycopg2.extensions.connection, limit: int
+) -> list[DisclosureClassified]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT d.{_DISCLOSURE_COLUMNS.replace(',', ', d.')}
+            FROM kap_disclosures d
+            LEFT JOIN kap_pdf_texts p ON d.disclosure_index = p.disclosure_index
+            WHERE (d.pdf_link IS NOT NULL OR d.attachment_urls::text LIKE '%%pdf%%')
+              AND p.disclosure_index IS NULL
+            ORDER BY d.disclosure_index DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    results: list[DisclosureClassified] = []
+    for row in rows:
+        try:
+            results.append(_row_to_disclosure(row))
+        except Exception as exc:
+            log.warning("DB satırı dönüştürülemedi (index={}): {}", row[0], exc)
+
+    return results
+
+
+async def upsert_pdf_text(disclosure_index: int, extracted_text: str) -> None:
+    """PDF'ten çıkarılan metni kap_pdf_texts tablosuna kaydeder."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _upsert_pdf_text_sync, conn, disclosure_index, extracted_text)
+
+
+def _upsert_pdf_text_sync(
+    conn: psycopg2.extensions.connection, disclosure_index: int, extracted_text: str
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO kap_pdf_texts (disclosure_index, extracted_text)
+            VALUES (%s, %s)
+            ON CONFLICT (disclosure_index) DO UPDATE
+                SET extracted_text = EXCLUDED.extracted_text,
+                    parsed_at      = NOW()
+            """,
+            (disclosure_index, extracted_text),
+        )
+
+
+# ---------------------------------------------------------------------------
+# PDF LLM Extraction İşlemleri
+# ---------------------------------------------------------------------------
+
+async def get_pdfs_needing_extraction(limit: int = 10) -> list[dict]:
+    """
+    kap_pdf_texts tablosunda metni olan ancak kap_pdf_parsed_data'da 
+    henüz ayrıştırılmamış kayıtları döndürür.
+    """
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _get_pdfs_needing_extraction_sync, conn, limit
+        )
+
+def _get_pdfs_needing_extraction_sync(
+    conn: psycopg2.extensions.connection, limit: int
+) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.disclosure_index, p.extracted_text, d.news_category, d.disclosure_type
+            FROM kap_pdf_texts p
+            JOIN kap_disclosures d ON p.disclosure_index = d.disclosure_index
+            LEFT JOIN kap_pdf_parsed_data e ON p.disclosure_index = e.disclosure_index
+            WHERE e.disclosure_index IS NULL
+            ORDER BY p.disclosure_index DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    results = []
+    for row in rows:
+        results.append({
+            "disclosure_index": row[0],
+            "extracted_text": row[1] or "",
+            "news_category": row[2] or "Genel",
+            "disclosure_type": row[3] or "Bilinmiyor"
+        })
+    return results
+
+async def upsert_pdf_parsed_data(disclosure_index: int, category_type: str, parsed_json: dict) -> None:
+    """LLM'den dönen yapılandırılmış veriyi kaydeder."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _upsert_pdf_parsed_data_sync, conn, disclosure_index, category_type, parsed_json)
+
+def _upsert_pdf_parsed_data_sync(
+    conn: psycopg2.extensions.connection, disclosure_index: int, category_type: str, parsed_json: dict
+) -> None:
+    json_str = json.dumps(parsed_json, ensure_ascii=False)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO kap_pdf_parsed_data (disclosure_index, category_type, parsed_json)
+            VALUES (%s, %s, %s::jsonb)
+            ON CONFLICT (disclosure_index) DO UPDATE
+                SET category_type = EXCLUDED.category_type,
+                    parsed_json   = EXCLUDED.parsed_json,
+                    extracted_at  = NOW()
+            """,
+            (disclosure_index, category_type, json_str),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gemma özet / analiz işlemleri
+# ---------------------------------------------------------------------------
+
+async def get_pending_gemma_summaries(
+    limit: int,
+    full_text_threshold: int = 1000,
+) -> list[dict[str, Any]]:
+    """Gemma ile özetlenmeye uygun ve henüz özetlenmemiş kayıtları döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _get_pending_gemma_summaries_sync, conn, limit, full_text_threshold
+        )
+
+
+def _get_pending_gemma_summaries_sync(
+    conn: psycopg2.extensions.connection,
+    limit: int,
+    full_text_threshold: int,
+) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                disclosure_index,
+                stock_codes,
+                company_name,
+                news_category,
+                disclosure_type,
+                title,
+                subject,
+                full_text,
+                pdf_link,
+                LENGTH(full_text) AS ft_len
+            FROM kap_disclosures
+            WHERE
+                (llm_summary IS NULL OR llm_summary = '')
+                AND llm_summary_at IS NULL
+                AND (
+                    LENGTH(full_text) > %s
+                    OR (
+                        (full_text IS NULL OR LENGTH(full_text) <= %s)
+                        AND pdf_link IS NOT NULL
+                        AND pdf_link != ''
+                    )
+                )
+            ORDER BY
+                CASE news_category
+                    WHEN 'Finansal Rapor' THEN 1
+                    WHEN 'Özel Durum'     THEN 2
+                    WHEN 'Sermaye'        THEN 3
+                    WHEN 'Temettü'        THEN 4
+                    ELSE 5
+                END,
+                disclosure_index DESC
+            LIMIT %s
+            """,
+            (full_text_threshold, full_text_threshold, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+async def save_gemma_summary(
+    disclosure_index: int,
+    summary: str,
+    source: str,
+    category: str,
+) -> None:
+    """Gemma özetini kap_disclosures ve kap_pdf_parsed_data tablolarına yazar."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _save_gemma_summary_sync,
+            conn,
+            disclosure_index,
+            summary,
+            source,
+            category,
+        )
+
+
+def _save_gemma_summary_sync(
+    conn: psycopg2.extensions.connection,
+    disclosure_index: int,
+    summary: str,
+    source: str,
+    category: str,
+) -> None:
+    parsed_json = json.dumps({"summary": summary, "source": source}, ensure_ascii=False)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE kap_disclosures
+               SET llm_summary        = %s,
+                   llm_summary_at     = NOW(),
+                   llm_summary_source = %s
+             WHERE disclosure_index = %s
+            """,
+            (summary, source, disclosure_index),
+        )
+        cur.execute(
+            """
+            INSERT INTO kap_pdf_parsed_data
+                (disclosure_index, category_type, parsed_json, summary, summarized_at)
+            VALUES (%s, %s, %s::jsonb, %s, NOW())
+            ON CONFLICT (disclosure_index) DO UPDATE
+                SET category_type = EXCLUDED.category_type,
+                    summary       = EXCLUDED.summary,
+                    parsed_json   = EXCLUDED.parsed_json,
+                    summarized_at = NOW()
+            """,
+            (disclosure_index, (category or "Genel")[:100], parsed_json, summary),
+        )
+
+
+async def mark_gemma_summary_failed(disclosure_index: int) -> None:
+    """Özetlenemeyen kaydı yeniden denenmemesi için işaretler."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _mark_gemma_summary_failed_sync, conn, disclosure_index)
+
+
+def _mark_gemma_summary_failed_sync(
+    conn: psycopg2.extensions.connection,
+    disclosure_index: int,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE kap_disclosures
+               SET llm_summary    = '__FAILED__',
+                   llm_summary_at = NOW()
+             WHERE disclosure_index = %s
+            """,
+            (disclosure_index,),
+        )
+
+
+async def get_gemma_summary_stats(
+    full_text_threshold: int = 1000,
+    min_text_length: int = 100,
+) -> dict[str, Any]:
+    """Gemma özetleme kapsam istatistiklerini döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            _get_gemma_summary_stats_sync,
+            conn,
+            full_text_threshold,
+            min_text_length,
+        )
+
+
+def _get_gemma_summary_stats_sync(
+    conn: psycopg2.extensions.connection,
+    full_text_threshold: int,
+    min_text_length: int,
+) -> dict[str, Any]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) AS toplam,
+                COUNT(CASE WHEN LENGTH(full_text) > %s THEN 1 END) AS fulltext_uzun,
+                COUNT(CASE WHEN LENGTH(full_text) <= %s
+                           AND pdf_link IS NOT NULL AND pdf_link != '' THEN 1 END) AS kisa_ama_pdf,
+                COUNT(CASE WHEN (full_text IS NULL OR LENGTH(full_text) < %s)
+                           AND (pdf_link IS NULL OR pdf_link = '') THEN 1 END) AS atlanacak,
+                COUNT(CASE WHEN llm_summary IS NOT NULL
+                           AND llm_summary != '__FAILED__' THEN 1 END) AS ozetlenmis,
+                COUNT(CASE WHEN llm_summary = '__FAILED__' THEN 1 END) AS basarisiz,
+                COUNT(CASE WHEN llm_summary_source = 'full_text' THEN 1 END) AS fulltext_kaynakli,
+                COUNT(CASE WHEN llm_summary_source = 'pdf' THEN 1 END) AS pdf_kaynakli
+            FROM kap_disclosures
+            """,
+            (full_text_threshold, full_text_threshold, min_text_length),
+        )
+        row = dict(cur.fetchone() or {})
+        fulltext_uzun = row.get("fulltext_uzun") or 0
+        kisa_ama_pdf = row.get("kisa_ama_pdf") or 0
+        ozetlenmis = row.get("ozetlenmis") or 0
+        basarisiz = row.get("basarisiz") or 0
+        row["bekleyen"] = fulltext_uzun + kisa_ama_pdf - ozetlenmis - basarisiz
+        return row
+
+
+async def get_gemma_summary_category_stats(full_text_threshold: int = 1000) -> list[dict[str, Any]]:
+    """Gemma özet kapsamını kategori bazında döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _get_gemma_summary_category_stats_sync, conn, full_text_threshold
+        )
+
+
+def _get_gemma_summary_category_stats_sync(
+    conn: psycopg2.extensions.connection,
+    full_text_threshold: int,
+) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT news_category,
+                   COUNT(*) AS n,
+                   COUNT(CASE WHEN LENGTH(full_text) > %s THEN 1 END) AS ft_uzun,
+                   COUNT(CASE WHEN LENGTH(full_text) <= %s
+                              AND pdf_link IS NOT NULL AND pdf_link != '' THEN 1 END) AS kisa_pdf,
+                   COUNT(CASE WHEN llm_summary IS NOT NULL
+                              AND llm_summary != '__FAILED__' THEN 1 END) AS ozetlenmis
+            FROM kap_disclosures
+            GROUP BY news_category
+            ORDER BY n DESC
+            """,
+            (full_text_threshold, full_text_threshold),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+async def get_pending_gemma_pdf_analyses(limit: int) -> list[dict[str, Any]]:
+    """PDF linki olan ve henüz Gemma yatırımcı değerlendirmesi yapılmamış kayıtları döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_pending_gemma_pdf_analyses_sync, conn, limit)
+
+
+def _get_pending_gemma_pdf_analyses_sync(
+    conn: psycopg2.extensions.connection,
+    limit: int,
+) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                d.disclosure_index,
+                d.company_name,
+                d.news_category,
+                d.title,
+                d.pdf_link,
+                SPLIT_PART(d.stock_codes, ',', 1) AS hisse
+            FROM kap_disclosures d
+            JOIN kap_companies c ON c.stock_code = SPLIT_PART(d.stock_codes, ',', 1)
+            WHERE
+                (c.member_type LIKE 'IGS%%' OR c.member_type = 'IGMS')
+                AND d.pdf_link IS NOT NULL AND d.pdf_link != ''
+                AND d.stock_codes IS NOT NULL AND d.stock_codes != ''
+                AND NOT EXISTS (
+                    SELECT 1 FROM kap_disclosure_analiz a
+                    WHERE a.disclosure_index = d.disclosure_index
+                )
+            ORDER BY
+                CASE d.news_category
+                    WHEN 'Finansal Rapor' THEN 1
+                    WHEN 'Özel Durum'     THEN 2
+                    WHEN 'Sermaye'        THEN 3
+                    ELSE 4
+                END,
+                RANDOM()
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+async def save_gemma_pdf_analysis(
+    disclosure_index: int,
+    reason: str,
+    sentiment: str,
+    confidence_score: float = 1.0,
+) -> None:
+    """Gemma yatırımcı değerlendirmesini kap_disclosure_analiz tablosuna yazar."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _save_gemma_pdf_analysis_sync,
+            conn,
+            disclosure_index,
+            reason,
+            sentiment,
+            confidence_score,
+        )
+
+
+def _save_gemma_pdf_analysis_sync(
+    conn: psycopg2.extensions.connection,
+    disclosure_index: int,
+    reason: str,
+    sentiment: str,
+    confidence_score: float,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO kap_disclosure_analiz
+                (disclosure_index, analyzed_text, sentiment_label, confidence_score)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (disclosure_index) DO UPDATE
+                SET analyzed_text    = EXCLUDED.analyzed_text,
+                    sentiment_label  = EXCLUDED.sentiment_label,
+                    confidence_score = EXCLUDED.confidence_score,
+                    analyzed_at      = CURRENT_TIMESTAMP
+            """,
+            (disclosure_index, reason, sentiment, confidence_score),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Analiz raporlama sorguları
+# ---------------------------------------------------------------------------
+
+async def get_analysis_disclosures(
+    min_price: bool = True,
+    require_sentiment: bool = False,
+    require_1d: bool = True,
+    category: str | None = None,
+    stock_code: str | None = None,
+) -> list[dict[str, Any]]:
+    """Event study/raporlama için temizlenmeye hazır bildirim satırlarını döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            _get_analysis_disclosures_sync,
+            conn,
+            min_price,
+            require_sentiment,
+            require_1d,
+            category,
+            stock_code,
+        )
+
+
+def _get_analysis_disclosures_sync(
+    conn: psycopg2.extensions.connection,
+    min_price: bool,
+    require_sentiment: bool,
+    require_1d: bool,
+    category: str | None,
+    stock_code: str | None,
+) -> list[dict[str, Any]]:
+    where_clauses = [
+        "stock_codes IS NOT NULL",
+        "stock_codes != ''",
+        "publish_datetime_utc IS NOT NULL",
+    ]
+    params: list[Any] = []
+    if min_price:
+        where_clauses.append("price_at_news IS NOT NULL")
+    if require_1d:
+        where_clauses.append("price_1d IS NOT NULL")
+    if require_sentiment:
+        where_clauses.append("sentiment IS NOT NULL")
+    if category:
+        where_clauses.append("news_category = %s")
+        params.append(category)
+    if stock_code:
+        where_clauses.append("stock_codes ILIKE %s")
+        params.append(f"%{stock_code.upper()}%")
+
+    where_sql = "WHERE " + " AND ".join(where_clauses)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                disclosure_index,
+                stock_codes,
+                company_name,
+                news_category,
+                sentiment,
+                publish_datetime_utc,
+                price_at_news,
+                price_5m,
+                price_1h,
+                price_1d,
+                price_1w,
+                subject,
+                kap_link
+            FROM kap_disclosures
+            {where_sql}
+            ORDER BY publish_datetime_utc DESC
+            """,
+            params,
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+async def get_analysis_data_quality_report() -> dict[str, Any]:
+    """Analiz veri kalitesi özetini döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_analysis_data_quality_report_sync, conn)
+
+
+def _get_analysis_data_quality_report_sync(conn: psycopg2.extensions.connection) -> dict[str, Any]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) AS toplam,
+                COUNT(price_at_news) AS fiyat_var,
+                COUNT(price_5m) AS price_5m_var,
+                COUNT(price_1h) AS price_1h_var,
+                COUNT(price_1d) AS price_1d_var,
+                COUNT(price_1w) AS price_1w_var,
+                COUNT(sentiment) AS sentiment_var,
+                COUNT(CASE WHEN price_at_news IS NOT NULL
+                           AND price_1d IS NOT NULL
+                           AND sentiment IS NOT NULL THEN 1 END) AS tam_kayit,
+                COUNT(CASE WHEN price_at_news IS NOT NULL
+                           AND price_1d IS NOT NULL THEN 1 END) AS fiyat_tam,
+                COUNT(DISTINCT stock_codes) AS benzersiz_hisse,
+                COUNT(DISTINCT news_category) AS benzersiz_kategori,
+                MIN(publish_datetime_utc) AS en_eski,
+                MAX(publish_datetime_utc) AS en_yeni
+            FROM kap_disclosures
+            WHERE stock_codes IS NOT NULL AND stock_codes != ''
+            """
+        )
+        return dict(cur.fetchone() or {})
+
+
+async def get_analysis_category_breakdown() -> list[dict[str, Any]]:
+    """Kategori bazlı analiz kapsamını döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_analysis_category_breakdown_sync, conn)
+
+
+def _get_analysis_category_breakdown_sync(conn: psycopg2.extensions.connection) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                news_category,
+                COUNT(*) AS total,
+                COUNT(price_1d) AS has_price_1d,
+                COUNT(sentiment) AS has_sentiment,
+                COUNT(CASE WHEN price_1d IS NOT NULL AND sentiment IS NOT NULL THEN 1 END) AS complete,
+                AVG(CASE WHEN price_at_news > 0 THEN
+                    (price_1d - price_at_news) / price_at_news * 100 END) AS avg_return_1d_pct
+            FROM kap_disclosures
+            WHERE stock_codes IS NOT NULL AND stock_codes != ''
+            GROUP BY news_category
+            ORDER BY total DESC
+            """
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+async def get_analysis_top_companies(limit: int = 20) -> list[dict[str, Any]]:
+    """En çok bildirimi olan şirketleri döndürür."""
+    async with get_connection() as conn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_analysis_top_companies_sync, conn, limit)
+
+
+def _get_analysis_top_companies_sync(
+    conn: psycopg2.extensions.connection,
+    limit: int,
+) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                primary_stock,
+                company_name,
+                COUNT(*) AS disclosure_count,
+                COUNT(price_1d) AS has_price_count,
+                AVG(CASE WHEN price_at_news > 0 THEN
+                    (price_1d - price_at_news) / price_at_news * 100 END) AS avg_return_1d
+            FROM (
+                SELECT
+                    SPLIT_PART(stock_codes, ',', 1) AS primary_stock,
+                    company_name,
+                    price_at_news,
+                    price_1d
+                FROM kap_disclosures
+                WHERE stock_codes IS NOT NULL AND stock_codes != ''
+            ) sub
+            GROUP BY primary_stock, company_name
+            ORDER BY disclosure_count DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+

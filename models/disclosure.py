@@ -20,13 +20,7 @@ from typing import Any
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-
-def _slugify(text: str) -> str:
-    """Türkçe karakterler dahil metni URL-dostu slug'a dönüştürür."""
-    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosucgiosu")
-    text = text.translate(tr_map).lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return text.strip("-")
+from utils.text import slugify
 
 
 class DisclosureRaw(BaseModel):
@@ -392,7 +386,7 @@ class DisclosureClassified(DisclosureRaw):
         if not self.company_slug:
             source = self.company_name or self.title
             if source:
-                self.company_slug = _slugify(source)
+                self.company_slug = slugify(source)
         return self
 
     @classmethod

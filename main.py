@@ -5,7 +5,9 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
@@ -15,15 +17,16 @@ from fastapi.templating import Jinja2Templates
 
 import classifier.company as company_svc
 import classifier.news_type as news_svc
-from classifier.sentiment import analyze_sentiment, client as _openai_client
 import db.repository as repo
 from db.connection import init_pool, close_pool, get_connection
 from db.models import create_tables
 from fetcher.base_provider import BaseKAPProvider
 from fetcher.provider_factory import get_provider
-from fetcher.finance import get_current_price, get_price_at_time, get_price_at_publish
+from fetcher.finance import get_price_at_time, get_price_at_publish
 from models.disclosure import DisclosureClassified, DisclosureRaw
 from utils.logger import get_logger
+from utils.pdf_parser import extract_text_from_pdf_url
+from classifier.local_llm import generate_summary
 
 log = get_logger(__name__)
 templates = Jinja2Templates(directory="web/templates")
@@ -49,7 +52,7 @@ def _provider_label() -> str:
 
 async def _fetch_and_classify() -> None:
     """
-    KAP'tan son bildirimleri çekip sınıflandırarak Oracle DB'ye kaydeder.
+    KAP'tan son bildirimleri çekip sınıflandırarak PostgreSQL'e kaydeder.
 
     API limit koruması:
       1. DB'deki son disclosure_index alınır.
@@ -64,8 +67,21 @@ async def _fetch_and_classify() -> None:
         if _provider is None:
             _provider = get_provider()
         last_seen = await repo.get_last_seen_index()
+
+        # Tutarlılık kontrolü: DB boş ama sync_state dolu ise → sıfırla
+        if last_seen > 0:
+            total_in_db = await repo.count_disclosures()
+            if total_in_db == 0:
+                log.warning(
+                    "DB boş ama sync_state dolu (last_seen={}). "
+                    "Sync state sıfırlanıyor.",
+                    last_seen,
+                )
+                await repo.update_last_seen_index(0)
+                last_seen = 0
+
         raw_items: list[DisclosureRaw] = await _provider.fetch_latest(
-            limit=500, since_index=last_seen
+            limit=15, since_index=last_seen
         )
     except Exception as exc:
         log.error("Provider hatası: {}", exc)
@@ -87,19 +103,6 @@ async def _fetch_and_classify() -> None:
                 news_category=news_svc.get_category_label(category),
                 company_slug=slug,
             )
-            
-            # LLM Duygu Analizi
-            sentiment_result = await analyze_sentiment(
-                classified.title,
-                classified.subject,
-                news_category=category,
-                disclosure_type=classified.disclosure_type,
-                full_text=classified.full_text,
-            )
-            if sentiment_result:
-                classified.sentiment = sentiment_result.sentiment
-                classified.sentiment_reason = sentiment_result.reason
-                
             # publish_datetime_utc'yi hesapla (model'de parse edilmişse kullan)
             if not classified.publish_datetime_utc:
                 classified.publish_datetime_utc = classified._parse_publish_datetime_utc()
@@ -142,62 +145,11 @@ async def _fetch_and_classify() -> None:
     log.info("Polling tamamlandı: {} yeni bildirim DB'ye eklendi.", new_count)
 
 
-async def _backfill_sentiment() -> None:
-    """
-    DB'de sentiment analizi yapılmamış (sentiment IS NULL) bildirimleri bulup
-    OpenAI API ile analiz eder. Her çalışmada en fazla 50 bildirimi işler.
-    Böylece uygulama yeniden başlatıldığında eski haberler tekrar analiz edilmez,
-    sadece eksik olanlar tamamlanır.
-    """
-    if not _openai_client:
-        return
-
-    try:
-        pending = await repo.get_disclosures_missing_sentiment(limit=50)
-        if not pending:
-            return
-
-        log.info("Sentiment backfill başladı: {} eksik kayıt işlenecek.", len(pending))
-        updated = 0
-
-        for disc in pending:
-            try:
-                category = news_svc.get_category_key(disc.news_category)
-                sentiment_result = await analyze_sentiment(
-                    disc.title,
-                    disc.subject,
-                    news_category=category,
-                    disclosure_type=disc.disclosure_type,
-                    full_text=disc.full_text,
-                )
-                if sentiment_result:
-                    await repo.update_sentiment(
-                        disc.disclosure_index,
-                        sentiment_result.sentiment,
-                        sentiment_result.reason,
-                    )
-                    updated += 1
-                else:
-                    # API yanıt verdı ama boş döndü — başarısız say
-                    await repo.mark_sentiment_failed(disc.disclosure_index)
-            except Exception as exc:
-                log.warning(
-                    "Backfill sentiment hatası (index={}): {}", disc.disclosure_index, exc
-                )
-                await repo.mark_sentiment_failed(disc.disclosure_index)
-
-        if updated > 0:
-            log.info("Sentiment backfill tamamlandı: {} kayıt güncellendi.", updated)
-
-    except Exception as exc:
-        log.error("Sentiment backfill genel hata: {}", exc)
-
-
 async def _backfill_full_text() -> None:
     """
     DB'de full_text alanı boş olan bildirimlerin tam içeriğini MKK API'den
     yeniden çeker (htmlMessages Base64 decode), DB'ye yazar ve
-    sentiment'i sıfırlar ki backfill_sentiment tarafından yeniden analiz edilsin.
+    Gemma özetleme/JSON değerlendirme araçlarının kullanacağı metni günceller.
     Her çalışmada en fazla 20 bildirimi işler.
     """
     global _provider
@@ -222,7 +174,6 @@ async def _backfill_full_text() -> None:
                     continue
 
                 # Geçici DisclosureRaw nesnesi üzerinden full_text hesapla
-                from models.disclosure import DisclosureRaw
                 tmp = DisclosureRaw(disclosureIndex=disc.disclosure_index)
                 tmp.enrich_from_detail(detail)
 
@@ -253,7 +204,6 @@ async def _update_prices() -> None:
         if not disclosures:
             return
 
-        from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
         updated_count = 0
 
@@ -346,6 +296,15 @@ async def _backfill_publish_datetime() -> None:
 # Lifespan
 # ---------------------------------------------------------------------------
 
+async def _run_deferred_startup_backfills() -> None:
+    """Ağır backfill'ler — HTTP'nin açılmasını bloklamasın diye yield sonrası arka planda çalışır."""
+    try:
+        await _backfill_full_text()
+        await _backfill_publish_datetime()
+    except Exception as exc:
+        log.error("Başlangıç backfill (ertelenmiş) hatası: {}", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _provider
@@ -355,34 +314,33 @@ async def lifespan(app: FastAPI):
     init_pool()
 
     # DB şemasını oluştur (eksik tablolar — IF NOT EXISTS, idempotent)
-    import asyncio
     async with get_connection() as conn:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, create_tables, conn)
 
+    # DB durumu logla
+    _total = await repo.count_disclosures()
+    _last_idx = await repo.get_last_seen_index()
+    log.info("DB durumu: {} bildirim, son index: {}", _total, _last_idx)
+
     # Provider ve ilk polling
     _provider = get_provider()
-    await _fetch_and_classify()
+    # Sürekli (yenilenen) API modeli kapatıldı.
+    # Sadece /scripts/fetch_historical.py (1000 adet) araç kullanılacak.
+    # await _fetch_and_classify()
 
-    # DB'deki sentiment eksik kayıtları tamamla (başlangıçta bir kez)
-    await _backfill_sentiment()
+    # Full_text / publish_datetime backfill — uzun sürebilir; arka planda başlat
+    asyncio.create_task(_run_deferred_startup_backfills())
 
-    # DB'deki full_text eksik kayıtları tamamla (başlangıçta bir kez)
-    await _backfill_full_text()
-
-    # Mevcut kayıtların publish_datetime_utc + price_at_news backfill (başlangıçta bir kez)
-    await _backfill_publish_datetime()
-
-    _scheduler.add_job(_fetch_and_classify, "interval", minutes=3, id="kap_poll")
+    # _scheduler.add_job(_fetch_and_classify, "interval", minutes=3, id="kap_poll")
     _scheduler.add_job(_update_prices, "interval", minutes=5, id="price_update")
-    _scheduler.add_job(_backfill_sentiment, "interval", minutes=10, id="sentiment_backfill")
     _scheduler.add_job(_backfill_full_text, "interval", minutes=15, id="full_text_backfill")
     _scheduler.add_job(_backfill_publish_datetime, "interval", minutes=10, id="publish_datetime_backfill")
     _scheduler.start()
     log.info(
-        "APScheduler başlatıldı — her 3 dakikada bir polling, "
+        "APScheduler başlatıldı — Sürekli KAP Polling KAPATILDI. "
         "her 5 dakikada bir fiyat güncellemesi, "
-        "her 10 dakikada bir sentiment + publish_datetime backfill, "
+        "her 10 dakikada bir publish_datetime backfill, "
         "her 15 dakikada bir full-text backfill."
     )
 
@@ -610,6 +568,94 @@ async def disclosure_detail(request: Request, index: int):
             **_base_ctx(),
         },
     )
+
+
+@app.get("/api/test-pdf-parser")
+async def api_test_pdf_parser(limit: int = 10) -> JSONResponse:
+    """Test endpoint for parsing PDFs of disclosures."""
+    pending_disclosures = await repo.get_disclosures_with_unparsed_pdfs(limit=limit)
+    if not pending_disclosures:
+        return JSONResponse(content={"message": "No pending PDFs found."})
+
+    results = []
+    success_count = 0
+
+    for disc in pending_disclosures:
+        # Determine the PDF link
+        pdf_link = disc.pdf_link
+        if not pdf_link and disc.attachment_urls:
+            for attachment in disc.attachment_urls:
+                if 'url' in attachment and str(attachment.get('fileName', '')).lower().endswith('.pdf'):
+                    pdf_link = attachment['url']
+                    break
+        
+        if not pdf_link:
+            results.append({"index": disc.disclosure_index, "status": "skipped_no_link"})
+            continue
+            
+        log.info(f"Downloading PDF for index {disc.disclosure_index}: {pdf_link}")
+        text = await extract_text_from_pdf_url(pdf_link)
+        
+        if text:
+            await repo.upsert_pdf_text(disc.disclosure_index, text)
+            success_count += 1
+            results.append({
+                "index": disc.disclosure_index, 
+                "status": "success", 
+                "length": len(text)
+            })
+        else:
+            results.append({"index": disc.disclosure_index, "status": "failed"})
+
+    return JSONResponse(content={
+        "total_processed": len(pending_disclosures),
+        "success_count": success_count,
+        "details": results
+    })
+
+
+@app.get("/api/test-pdf-extractor")
+async def api_test_pdf_extractor(limit: int = 5) -> JSONResponse:
+    """Yerel Gemma ile PDF metinlerinden yatırımcı özeti çıkaran test endpoint'i."""
+    pending_pdfs = await repo.get_pdfs_needing_extraction(limit=limit)
+    if not pending_pdfs:
+        return JSONResponse(content={"message": "No pending PDF texts found for extraction."})
+
+    results = []
+    success_count = 0
+
+    for item in pending_pdfs:
+        disclosure_index = item["disclosure_index"]
+        text = item["extracted_text"]
+        category = item["news_category"]
+        dtype = item["disclosure_type"]
+        
+        log.info(f"Local LLM ile özetleniyor: {disclosure_index}")
+        summary = await generate_summary(text)
+        
+        if summary and summary != "Özetleme işlemi başarısız.":
+            parsed_json = {
+                "summary": summary,
+                "source": "gemma_local",
+            }
+            
+            category_type = category if category else dtype
+            await repo.upsert_pdf_parsed_data(disclosure_index, category_type, parsed_json)
+            success_count += 1
+            results.append({
+                "index": disclosure_index,
+                "status": "success",
+                "extracted_keys": list(parsed_json.keys()),
+                "data": parsed_json
+            })
+        else:
+            results.append({"index": disclosure_index, "status": "failed"})
+
+    return JSONResponse(content={
+        "total_processed": len(pending_pdfs),
+        "success_count": success_count,
+        "details": results
+    })
 
 
 @app.get("/health")

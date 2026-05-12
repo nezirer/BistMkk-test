@@ -42,6 +42,8 @@ _RETRY_BASE_DELAY = 1.0  # saniye — 429 exponential backoff başlangıcı
 class MKKSettings(BaseSettings):
     mkk_api_user: str = ""
     mkk_api_pass: str = ""
+    mkk_api_key: str = ""
+    mkk_bearer_token: str = ""
     mkk_api_base_url: str = "https://apigwdev.mkk.com.tr/api/vyk"
     mkk_env: str = "test"
 
@@ -50,27 +52,38 @@ class MKKSettings(BaseSettings):
 
 class MKKProvider(BaseKAPProvider):
     """
-    MKK API Gateway (apigwdev.mkk.com.tr/api/vyk) üzerinden KAP
-    bildirimlerine erişim sağlar.
+    MKK API Gateway üzerinden KAP bildirimlerine erişim sağlar.
+    Test ortamında HTTP Basic Auth, Üretim (Prod) ortamında Bearer Token kullanılır.
     """
 
     def __init__(self) -> None:
         self.settings = MKKSettings()
         self.base_url = self.settings.mkk_api_base_url.rstrip("/")
+        self.is_prod = self.settings.mkk_env.lower() in ("prod", "production")
 
-        # Spec: basicAuth (HTTP Basic) — Authorization: Basic base64(user:pass)
+        # Spec: basicAuth (HTTP Basic) - Her iki ortamda da geçerli.
         self.auth = httpx.BasicAuth(
             username=self.settings.mkk_api_user,
             password=self.settings.mkk_api_pass,
         )
+        
         self.headers: dict[str, str] = {"Accept": "application/json"}
+        
+        self.auth_token: str | None = self.settings.mkk_bearer_token if self.settings.mkk_bearer_token else None
+        self.token_expires_at: float = float('inf')  # Manuel token olduğu için süre hesabı yapılmıyor
 
         self.client = httpx.AsyncClient(
             auth=self.auth,
             headers=self.headers,
-            timeout=15.0,
+            timeout=60.0,
             follow_redirects=True,
         )
+
+    async def _ensure_token(self) -> None:
+        """Kullanıcı isteği ile OTO-TOKEN kapatıldı, manuel token kullanılıyor (veya Basic Auth)."""
+        if self.is_prod and not self.auth_token:
+            log.info("Prod ortamı için MKK_BEARER_TOKEN bulunamadı, Basic Auth ile devam edilecek.")
+        return
 
     # ------------------------------------------------------------------
     # İç yardımcı
@@ -86,9 +99,18 @@ class MKKProvider(BaseKAPProvider):
         Başarıda parse edilmiş JSON döner; hata durumunda exception fırlatır.
         """
         url = f"{self.base_url}{path}"
+        
+        if self.is_prod:
+            await self._ensure_token()
+            req_headers = dict(self.headers)
+            if self.auth_token:
+                req_headers["Authorization"] = f"Bearer {self.auth_token}"
+        else:
+            req_headers = self.headers
+            
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                resp = await self.client.get(url, params=params)
+                resp = await self.client.get(url, params=params, headers=req_headers)
 
                 if resp.status_code == 401:
                     log.error(

@@ -92,37 +92,8 @@
 </div>
 
 <!-- Sayfalama -->
-{% if total_pages > 1 %}
-<div class="mt-6 flex items-center justify-between">
-  <p class="text-sm text-slate-500">
-    Sayfa <strong>{{ page }}</strong> / <strong>{{ total_pages }}</strong>
-    &mdash; toplam <strong>{{ total }}</strong> şirket
-  </p>
-  <div class="flex items-center gap-2">
-    {% if page > 1 %}
-    <a href="?page={{ page - 1 }}{% if search_query %}&q={{ search_query }}{% endif %}"
-       class="px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors">
-      ← Önceki
-    </a>
-    {% endif %}
-
-    {% for p in range([1, page - 2]|max, [total_pages + 1, page + 3]|min) %}
-    <a href="?page={{ p }}{% if search_query %}&q={{ search_query }}{% endif %}"
-       class="px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors
-              {% if p == page %}border-brand-500 bg-brand-600 text-white{% else %}border-slate-200 bg-white text-slate-700 hover:bg-slate-50{% endif %}">
-      {{ p }}
-    </a>
-    {% endfor %}
-
-    {% if page < total_pages %}
-    <a href="?page={{ page + 1 }}{% if search_query %}&q={{ search_query }}{% endif %}"
-       class="px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors">
-      Sonraki →
-    </a>
-    {% endif %}
-  </div>
-</div>
-{% endif %}
+{% set show_total_text = true %}
+{% include 'partials/pagination.html' %}
 
 {% else %}
 <div class="bg-white rounded-xl border border-slate-200 text-center py-20 text-slate-400">
